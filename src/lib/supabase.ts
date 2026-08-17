@@ -65,16 +65,34 @@ export async function resolveSupabaseIdentity(): Promise<{
   role: string | null;
   error: string | null;
 }> {
-  try {
+  const readOnce = async () => {
     const supabase = await getSupabase();
     const { data, error } = await supabase.rpc("current_identity");
     if (error) return { uid: null, role: null, error: error.message };
-    const row = Array.isArray(data) ? data[0] : data;
-    return { uid: row?.uid ?? null, role: row?.role ?? null, error: null };
+    const row = (Array.isArray(data) ? data[0] : data) as {
+      uid?: string | null;
+      firebase_uid?: string | null;
+      role?: string | null;
+      jwt_role?: string | null;
+    } | null;
+    return {
+      uid: row?.uid ?? row?.firebase_uid ?? null,
+      role: row?.role ?? row?.jwt_role ?? null,
+      error: null as string | null,
+    };
+  };
+
+  try {
+    const first = await readOnce();
+    if (first.uid || first.error) return first;
+    // No identity resolved — the token may be stale. Force a refresh and retry once.
+    await getFirebaseIdToken(true);
+    return await readOnce();
   } catch (error) {
     return { uid: null, role: null, error: error instanceof Error ? error.message : String(error) };
   }
 }
+
 
 /** Translate raw Postgres/Storage failures into layer-specific, actionable messages. */
 export function explainSupabaseError(error: unknown): string {

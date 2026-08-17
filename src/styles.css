@@ -118,6 +118,8 @@
     color: var(--foreground);
     font-family: var(--font-body);
     overflow-x: hidden;
+    overscroll-behavior-y: none;
+    -webkit-tap-highlight-color: transparent;
     -webkit-font-smoothing: antialiased;
   }
   h1,
@@ -144,4 +146,22 @@
 @utility scroll-thin {
   scrollbar-width: thin;
   scrollbar-color: var(--border) transparent;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  /* Prevent iOS zoom-on-focus for form controls. */
+  input,
+  textarea,
+  select {
+    font-size: max(16px, 1rem);
+  }
+  img,
+  video,
+  canvas {
+    max-width: 100%;
+    height: auto;
+  }
 }

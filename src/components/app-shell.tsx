@@ -31,7 +31,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   return (
     <div className="flex min-h-screen flex-col bg-background">
       <header className="sticky top-0 z-30 border-b border-border/70 bg-background/85 backdrop-blur">
-        <div className="mx-auto flex w-full max-w-6xl items-center gap-3 px-4 py-3">
+        <div className="mx-auto flex w-full max-w-6xl items-center gap-3 px-4 py-3 pt-[max(0.75rem,env(safe-area-inset-top))]">
           <Link to="/chat" className="flex items-center gap-2 font-display text-lg font-semibold">
             <Sparkles className="size-5 text-primary" aria-hidden />
             Always Together
@@ -58,16 +58,16 @@ export function AppShell({ children }: { children: ReactNode }) {
         </div>
       </header>
 
-      <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-6">{children}</main>
+      <main className="mx-auto w-full max-w-6xl min-w-0 flex-1 px-4 py-6">{children}</main>
 
       <nav className="sticky bottom-0 z-30 border-t border-border/70 bg-background/95 backdrop-blur md:hidden">
-        <div className="flex items-center justify-around px-2 py-2">
+        <div className="flex items-center justify-around px-2 py-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]">
           {NAV.map((item) => (
             <Link
               key={item.to}
               to={item.to}
               className={cn(
-                "flex flex-col items-center gap-1 rounded-md px-3 py-1 text-[11px] font-medium text-muted-foreground",
+                "flex min-h-11 min-w-11 flex-col items-center justify-center gap-1 rounded-md px-3 py-1 text-[11px] font-medium text-muted-foreground",
                 pathname.startsWith(item.to) && "text-primary",
               )}
             >

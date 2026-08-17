@@ -84,14 +84,22 @@ function DiagnosticsPage() {
         const supabase = await getSupabase();
         const { data, error } = await supabase.rpc("current_identity");
         if (error) throw new Error(error.message);
-        const row = Array.isArray(data) ? data[0] : data;
-        const uid = (row as { firebase_uid?: string } | null)?.firebase_uid ?? null;
+        const row = (Array.isArray(data) ? data[0] : data) as {
+          uid?: string | null;
+          firebase_uid?: string | null;
+          role?: string | null;
+          jwt_role?: string | null;
+          aud?: string | null;
+          iss?: string | null;
+        } | null;
+        const uid = row?.uid ?? row?.firebase_uid ?? null;
+        const role = row?.role ?? row?.jwt_role ?? null;
         push(
           "Third-party JWT bridge accepted",
           Boolean(uid) && uid === auth.firebaseUser?.uid,
           uid
-            ? `Database sees uid ${uid} (role ${(row as { jwt_role?: string }).jwt_role ?? "unknown"})`
-            : "Database resolved no identity from the token — check Third-Party Auth registration",
+            ? `Database sees uid ${uid} · role ${role ?? "unknown"}${row?.iss ? ` · iss ${row.iss}` : ""}`
+            : "Database resolved no identity from the token — re-run src/db/setup.sql, then check Supabase → Authentication → Third-Party Auth registration",
         );
       } catch (error) {
         push(
@@ -100,6 +108,7 @@ function DiagnosticsPage() {
           error instanceof Error ? error.message : "failed",
         );
       }
+
 
       // Layer 4 — RLS-protected read
       try {

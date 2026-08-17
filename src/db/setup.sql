@@ -18,19 +18,28 @@ returns text
 language sql
 stable
 as $$
-  select nullif(auth.jwt() ->> 'sub', '')
+  select nullif(coalesce(auth.jwt() ->> 'sub', auth.jwt() ->> 'user_id'), '')
 $$;
 
+-- Return signature changed (uid/role -> uid/role/aud/iss/email), so drop first.
+drop function if exists public.current_identity();
+
 create or replace function public.current_identity()
-returns table (uid text, role text)
+returns table (uid text, role text, aud text, iss text, email text)
 language sql
 stable
 as $$
-  select public.firebase_uid(), coalesce(auth.role(), 'anon')
+  select
+    public.firebase_uid(),
+    coalesce(nullif(auth.jwt() ->> 'role', ''), auth.role(), 'anon'),
+    auth.jwt() ->> 'aud',
+    auth.jwt() ->> 'iss',
+    auth.jwt() ->> 'email'
 $$;
 
 grant execute on function public.firebase_uid() to authenticated, anon;
 grant execute on function public.current_identity() to authenticated, anon;
+
 
 create or replace function public.touch_updated_at()
 returns trigger

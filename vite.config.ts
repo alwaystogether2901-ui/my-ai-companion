@@ -23,7 +23,6 @@ export default defineConfig({
         devOptions: { enabled: false },
         manifest: false,
         workbox: {
-          globDirectory: undefined,
           navigateFallback: null,
           // Never precache HTML documents or auth-bearing responses.
           globPatterns: ["**/*.{js,css,woff2,png,svg,ico}"],

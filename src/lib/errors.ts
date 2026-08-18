@@ -129,7 +129,12 @@ function classify(error: unknown): AppErrorKind {
   if (status === 401 || status === 403 || message.includes("jwt") || message.includes("unauthorized")) {
     return "auth";
   }
-  if (message.includes("bucket") || message.includes("object") === false ? false : false) {
+  if (
+    message.includes("bucket") ||
+    message.includes("payload too large") ||
+    message.includes("exceeded the maximum allowed size") ||
+    message.includes("mime type")
+  ) {
     return "storage";
   }
   if (message.includes("failed to fetch") || message.includes("networkerror") || message.includes("load failed")) {

@@ -7,8 +7,11 @@ import { FileUp, Loader2, RotateCcw } from "lucide-react";
 import { AuthGate } from "@/components/auth-gate";
 import { assertAuthorized, useAuth } from "@/lib/auth";
 import { listJobs, listReplicas, listSourceFiles } from "@/lib/data";
+import { listParticipants } from "@/lib/data";
+import { toDisplayMessage } from "@/lib/errors";
 import {
   ALLOWED_IMPORT_EXTENSIONS,
+  finalizeParticipantRoles,
   importConversationFile,
   retryImport,
   validateImportFile,
@@ -58,6 +61,9 @@ function UploadPage() {
   const [replicaName, setReplicaName] = useState("");
   const [targetReplica, setTargetReplica] = useState<string>("new");
   const [progress, setProgress] = useState<ImportProgress | null>(null);
+  const [selectReplicaId, setSelectReplicaId] = useState<string | null>(null);
+  const [meId, setMeId] = useState<string>("");
+  const [replicaPersonId, setReplicaPersonId] = useState<string>("");
   const [dragging, setDragging] = useState(false);
 
   const replicas = useQuery({ queryKey: ["replicas"], queryFn: listReplicas });
@@ -90,11 +96,13 @@ function UploadPage() {
         { description: result.duplicate ? "Note: this file looked like a previous upload." : undefined },
       );
       void queryClient.invalidateQueries();
-      navigate({ to: "/chat", search: { replica: result.replicaId } });
+      setSelectReplicaId(result.replicaId);
+      setMeId("");
+      setReplicaPersonId("");
     },
-    onError: (error: Error) => {
+    onError: (error: unknown) => {
       setProgress(null);
-      toast.error(error.message);
+      toast.error(toDisplayMessage(error));
     },
   });
 
@@ -108,10 +116,40 @@ function UploadPage() {
       toast.success("Reprocessed successfully.");
       void queryClient.invalidateQueries();
     },
-    onError: (error: Error) => {
+    onError: (error: unknown) => {
       setProgress(null);
-      toast.error(error.message);
+      toast.error(toDisplayMessage(error));
     },
+  });
+
+  const participants = useQuery({
+    queryKey: ["participants", selectReplicaId],
+    queryFn: () => listParticipants(selectReplicaId!),
+    enabled: Boolean(selectReplicaId),
+  });
+
+  const finalize = useMutation({
+    mutationFn: async () => {
+      const ownerId = assertAuthorized(auth);
+      if (!selectReplicaId) throw new Error("No imported replica selected.");
+      if (!meId || !replicaPersonId) throw new Error("Choose both ME and the REPLICA.");
+      return finalizeParticipantRoles({
+        ownerId,
+        replicaId: selectReplicaId,
+        meParticipantId: meId,
+        replicaParticipantId: replicaPersonId,
+      });
+    },
+    onSuccess: (result) => {
+      const replicaId = selectReplicaId!;
+      setSelectReplicaId(null);
+      toast.success(
+        `Replica built from ${result.replicaName} (${result.replicaMessages.toLocaleString()} of their messages analyzed).`,
+      );
+      void queryClient.invalidateQueries();
+      navigate({ to: "/chat", search: { replica: replicaId } });
+    },
+    onError: (error: unknown) => toast.error(toDisplayMessage(error)),
   });
 
   function chooseFile(next: File | null) {
@@ -208,9 +246,69 @@ function UploadPage() {
         )}
       </section>
 
+      {selectReplicaId && (
+        <section className="space-y-4 rounded-xl border border-primary/40 bg-primary/5 p-4">
+          <div>
+            <h2 className="font-display text-lg font-semibold">Who is who?</h2>
+            <p className="text-sm text-muted-foreground">
+              We detected these people in the export. Tell us which one is you and which one the
+              replica should become — only the selected person&apos;s messages are analyzed.
+            </p>
+          </div>
+          {participants.isLoading ? (
+            <Loader2 className="size-5 animate-spin text-primary" aria-label="Loading" />
+          ) : (
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-1.5">
+                <Label htmlFor="me-select">Which person are YOU?</Label>
+                <Select value={meId} onValueChange={setMeId}>
+                  <SelectTrigger id="me-select">
+                    <SelectValue placeholder="Select yourself" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(participants.data ?? []).map((person) => (
+                      <SelectItem key={person.id} value={person.id}>
+                        {person.display_name} · {person.message_count.toLocaleString()} msgs
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="replica-select">Who should become the REPLICA?</Label>
+                <Select value={replicaPersonId} onValueChange={setReplicaPersonId}>
+                  <SelectTrigger id="replica-select">
+                    <SelectValue placeholder="Select the replica" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {(participants.data ?? [])
+                      .filter((person) => person.id !== meId)
+                      .map((person) => (
+                        <SelectItem key={person.id} value={person.id}>
+                          {person.display_name} · {person.message_count.toLocaleString()} msgs
+                        </SelectItem>
+                      ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+          )}
+          <Button
+            onClick={() => finalize.mutate()}
+            disabled={!meId || !replicaPersonId || finalize.isPending}
+            className="w-full sm:w-auto"
+          >
+            {finalize.isPending && <Loader2 className="size-4 animate-spin" aria-hidden />}
+            Build the replica
+          </Button>
+        </section>
+      )}
+
       {progress && (
         <section className="rounded-lg border border-border bg-card p-4">
-          <p className="text-sm font-medium">{progress.step}</p>
+          <p className="text-sm font-medium">
+            {progress.stage} — {progress.step}
+          </p>
           <Progress value={progress.progress} className="mt-3" />
           <p className="mt-2 text-xs text-muted-foreground">
             {Math.round(progress.progress)}% — keep this tab open until it finishes.

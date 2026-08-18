@@ -4,43 +4,17 @@
 //     nitro (build-only using cloudflare as a default target), VITE_* env injection, @ path alias,
 //     React/TanStack dedupe, error logger plugins, and sandbox detection (port/host/strictPort).
 // You can pass additional config via defineConfig({ vite: { ... }, etc... }) if needed.
+//
+// PWA: the service worker is a hand-written static file at public/sw.js and the
+// manifest is public/manifest.webmanifest. A generated-SW plugin was removed —
+// with the nitro/cloudflare server build it never emitted sw.js into the
+// deployed output, so production kept requesting /sw.js and getting 404.
 import { defineConfig } from "@lovable.dev/vite-tanstack-config";
-import { VitePWA } from "vite-plugin-pwa";
 
 export default defineConfig({
   tanstackStart: {
     // Redirect TanStack Start's bundled server entry to src/server.ts (our SSR error wrapper).
     // nitro/vite builds from this
     server: { entry: "server" },
-  },
-  vite: {
-    plugins: [
-      VitePWA({
-        strategies: "generateSW",
-        registerType: "autoUpdate",
-        injectRegister: null,
-        filename: "sw.js",
-        devOptions: { enabled: false },
-        manifest: false,
-        workbox: {
-          navigateFallback: null,
-          // Never precache HTML documents or auth-bearing responses.
-          globPatterns: ["**/*.{js,css,woff2,png,svg,ico}"],
-          runtimeCaching: [
-            {
-              urlPattern: ({ request }) => request.mode === "navigate",
-              handler: "NetworkFirst",
-              options: { cacheName: "at-pages", networkTimeoutSeconds: 5 },
-            },
-            {
-              urlPattern: ({ request, sameOrigin }) =>
-                sameOrigin && (request.destination === "script" || request.destination === "style"),
-              handler: "CacheFirst",
-              options: { cacheName: "at-assets" },
-            },
-          ],
-        },
-      }),
-    ],
   },
 });

@@ -562,7 +562,7 @@ export async function finalizeParticipantRoles(choice: ParticipantChoice): Promi
     senderName: row.sender_name ?? replicaParticipant.display_name,
     text: row.message_text ?? "",
     sentAt: row.sent_at ?? null,
-    messageType: row.message_type ?? "text",
+    messageType: row.message_type === "media" ? ("media" as const) : ("text" as const),
   }));
   const style = analyzeStyle(styleInput);
   const { error: styleError } = await supabase.from("replica_style_profiles").upsert(

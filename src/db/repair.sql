@@ -322,3 +322,239 @@ set status = 'failed',
     completed_at = now()
 where status = 'processing'
   and coalesce(started_at, created_at) < now() - interval '30 minutes';
+
+-- ===========================================================================
+-- 10. LARGE-DATASET SCALABILITY (300k+ messages)
+--     Every function below is SECURITY INVOKER, so RLS still applies, and each
+--     one additionally filters on public.firebase_uid(): generic for all users,
+--     no hardcoded ids.
+-- ===========================================================================
+
+-- Indexes that keep 300k-row imports, retrieval and deletion fast.
+create index if not exists messages_replica_time_idx
+  on public.messages (replica_id, sent_at nulls last);
+create index if not exists messages_replica_role_time_idx
+  on public.messages (replica_id, sender_role, sent_at desc nulls last);
+create index if not exists messages_owner_replica_idx
+  on public.messages (owner_id, replica_id);
+create index if not exists conversations_replica_idx
+  on public.conversations (replica_id);
+create index if not exists chat_session_messages_session_idx
+  on public.chat_session_messages (session_id, created_at);
+create index if not exists chat_session_messages_reply_idx
+  on public.chat_session_messages (reply_to_message_id);
+
+-- ---------------------------------------------------------------------------
+-- 10a. ME / REPLICA role assignment as ONE set-based statement per role.
+--      Previously three full-table UPDATEs from the browser timed out on large
+--      imports (the "cancelled / timeout" import failure).
+-- ---------------------------------------------------------------------------
+create or replace function public.assign_participant_roles(
+  p_replica_id uuid,
+  p_me uuid,
+  p_replica uuid
+)
+returns table (me_messages bigint, replica_messages bigint, other_messages bigint)
+language plpgsql
+volatile
+as $$
+declare
+  v_uid text := public.firebase_uid();
+begin
+  if v_uid is null then
+    raise exception 'No identity resolved from the token';
+  end if;
+  if p_me = p_replica then
+    raise exception 'ME and REPLICA must be different participants';
+  end if;
+
+  update public.replica_participants
+  set role = case
+        when id = p_me then 'me'
+        when id = p_replica then 'replica'
+        else 'other'
+      end
+  where replica_id = p_replica_id
+    and owner_id = v_uid;
+
+  update public.messages m
+  set sender_role = case
+        when m.participant_id = p_me then 'me'
+        when m.participant_id = p_replica then 'replica'
+        else 'other'
+      end
+  where m.replica_id = p_replica_id
+    and m.owner_id = v_uid
+    and coalesce(m.sender_role, '') <> case
+        when m.participant_id = p_me then 'me'
+        when m.participant_id = p_replica then 'replica'
+        else 'other'
+      end;
+
+  return query
+  select
+    count(*) filter (where sender_role = 'me'),
+    count(*) filter (where sender_role = 'replica'),
+    count(*) filter (where sender_role = 'other')
+  from public.messages
+  where replica_id = p_replica_id and owner_id = v_uid;
+end $$;
+
+grant execute on function public.assign_participant_roles(uuid, uuid, uuid) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 10b. Batched replica deletion. A single cascading DELETE on a 300k-message
+--      replica exceeds the statement timeout; the client loops this until
+--      done = true. Ownership is enforced on every statement.
+-- ---------------------------------------------------------------------------
+create or replace function public.delete_replica_batch(
+  p_replica_id uuid,
+  p_batch integer default 20000
+)
+returns table (deleted integer, done boolean)
+language plpgsql
+volatile
+as $$
+declare
+  v_uid text := public.firebase_uid();
+  v_deleted integer := 0;
+  v_owns boolean;
+begin
+  if v_uid is null then
+    raise exception 'No identity resolved from the token';
+  end if;
+
+  select exists (
+    select 1 from public.replicas
+    where id = p_replica_id and owner_id = v_uid
+  ) into v_owns;
+  if not v_owns then
+    return query select 0, true;
+    return;
+  end if;
+
+  with doomed as (
+    select id from public.messages
+    where replica_id = p_replica_id and owner_id = v_uid
+    limit greatest(1000, least(coalesce(p_batch, 20000), 50000))
+  )
+  delete from public.messages m using doomed d where m.id = d.id;
+  get diagnostics v_deleted = row_count;
+
+  if v_deleted > 0 then
+    return query select v_deleted, false;
+    return;
+  end if;
+
+  delete from public.memory_embeddings where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.memory_items where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.conversations where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.replica_participants where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.replica_style_profiles where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.processing_jobs where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.source_files where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.chat_session_messages
+    where owner_id = v_uid
+      and session_id in (select id from public.chat_sessions where replica_id = p_replica_id and owner_id = v_uid);
+  delete from public.chat_sessions where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.generated_responses where replica_id = p_replica_id and owner_id = v_uid;
+  delete from public.replicas where id = p_replica_id and owner_id = v_uid;
+
+  return query select 0, true;
+end $$;
+
+grant execute on function public.delete_replica_batch(uuid, integer) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 10c. Contextual retrieval: real exchanges (situation -> what THEY replied).
+--      Ranks by trigram similarity to the incoming message and, when supplied,
+--      to the recent conversation context, so the chosen example fits the
+--      CURRENT situation rather than being the first lexical match.
+-- ---------------------------------------------------------------------------
+drop function if exists public.search_similar_exchanges(uuid, text, integer);
+create or replace function public.search_similar_exchanges(
+  p_replica_id uuid,
+  p_query text,
+  p_limit integer default 8,
+  p_context text default ''
+)
+returns table (
+  prompt_text text,
+  prompt_sender text,
+  reply_text text,
+  similarity double precision,
+  context_similarity double precision,
+  sent_at timestamptz
+)
+language sql
+stable
+as $$
+  with base as (
+    select
+      m.message_text,
+      m.sender_name,
+      m.sender_role,
+      m.sent_at,
+      lead(m.message_text) over w as next_text,
+      lead(m.sender_role) over w as next_role,
+      similarity(m.message_text, coalesce(p_query, '')) as sim,
+      case when coalesce(p_context, '') = '' then 0
+           else similarity(m.message_text, p_context) end as ctx_sim
+    from public.messages m
+    where m.replica_id = p_replica_id
+      and m.owner_id = public.firebase_uid()
+      and m.message_text is not null
+      and length(m.message_text) between 2 and 1500
+      and coalesce(p_query, '') <> ''
+      and (
+        m.sender_role = 'replica'
+        or m.message_text % p_query
+        or (coalesce(p_context, '') <> '' and m.message_text % p_context)
+      )
+    window w as (order by m.sent_at nulls last, m.created_at)
+  )
+  select
+    message_text,
+    sender_name,
+    next_text,
+    sim::double precision,
+    ctx_sim::double precision,
+    sent_at
+  from base
+  where sender_role <> 'replica'
+    and next_role = 'replica'
+    and next_text is not null
+    and length(btrim(next_text)) > 0
+    and (sim > 0.08 or ctx_sim > 0.12)
+  order by (sim * 0.75 + ctx_sim * 0.25) desc
+  limit greatest(1, least(coalesce(p_limit, 8), 40))
+$$;
+
+grant execute on function public.search_similar_exchanges(uuid, text, integer, text) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 10d. Frequent authentic wording from the REPLICA person only. Used to keep
+--      generated wording inside their real vocabulary.
+-- ---------------------------------------------------------------------------
+create or replace function public.replica_frequent_lines(
+  p_replica_id uuid,
+  p_limit integer default 25
+)
+returns table (message_text text, uses bigint)
+language sql
+stable
+as $$
+  select lower(btrim(m.message_text)) as message_text, count(*) as uses
+  from public.messages m
+  where m.replica_id = p_replica_id
+    and m.owner_id = public.firebase_uid()
+    and m.sender_role = 'replica'
+    and m.message_text is not null
+    and length(btrim(m.message_text)) between 2 and 120
+  group by 1
+  having count(*) > 1
+  order by uses desc
+  limit greatest(1, least(coalesce(p_limit, 25), 60))
+$$;
+
+grant execute on function public.replica_frequent_lines(uuid, integer) to authenticated;

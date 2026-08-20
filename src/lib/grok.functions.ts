@@ -27,64 +27,125 @@ export type GenerateReplyResult = {
     | "unknown";
 };
 
-/* =====================================================================
+/* ================================================================
    TYPES
-===================================================================== */
+================================================================ */
 
-type RetrievalExchange = {
-  prompt_text?: string | null;
-  prompt_sender?: string | null;
-  reply_text?: string | null;
-  similarity?: number | null;
-  sent_at?: string | null;
+type HistoricalMessage = {
+  id: number;
+  sender_role: string | null;
+  sender_name: string | null;
+  message_text: string | null;
+  reply_to_message_id: number | null;
+  sent_at: string | null;
 };
 
-type RetrievedMessage = {
-  message_text?: string | null;
-  sender_name?: string | null;
-  sender_role?: string | null;
-  sent_at?: string | null;
+type SimilarExchange = {
+  userMessage: string;
+  replicaReply: string;
+  similarity: number;
 };
 
-type RetrievedMemory = {
-  id?: string | null;
-  title?: string | null;
-  description?: string | null;
-  media_type?: string | null;
-  storage_path?: string | null;
+type StyleProfile = {
+  language_profile?: unknown;
+  emoji_profile?: unknown;
+  punctuation_profile?: unknown;
+  response_length_profile?: unknown;
+  greeting_profile?: unknown;
+  humor_profile?: unknown;
+  vocabulary_profile?: unknown;
+  custom_instructions?: unknown;
 };
 
-type ChatHistoryRow = {
-  sender_role?: string | null;
-  message_text?: string | null;
-  created_at?: string | null;
-};
-
-/* =====================================================================
+/* ================================================================
    HELPERS
-===================================================================== */
+================================================================ */
 
 function cleanText(value: unknown): string {
-  return typeof value === "string" ? value.trim() : "";
+  return typeof value === "string"
+    ? value.trim()
+    : "";
 }
 
-function clampText(value: unknown, max: number): string {
-  const text = cleanText(value);
+function clamp(
+  value: string,
+  max: number,
+): string {
+  return value.length > max
+    ? `${value.slice(0, max)}…`
+    : value;
+}
 
-  if (text.length <= max) {
-    return text;
+function normalizeText(
+  value: string,
+): string {
+  return value
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function tokenize(
+  value: string,
+): string[] {
+  return normalizeText(value)
+    .split(" ")
+    .filter(
+      (word) =>
+        word.length >= 2,
+    );
+}
+
+/* ================================================================
+   SIMPLE LOCAL SIMILARITY
+   Used only to rank messages already retrieved from Supabase.
+================================================================ */
+
+function similarityScore(
+  query: string,
+  candidate: string,
+): number {
+  const queryWords = new Set(
+    tokenize(query),
+  );
+
+  const candidateWords = new Set(
+    tokenize(candidate),
+  );
+
+  if (
+    queryWords.size === 0 ||
+    candidateWords.size === 0
+  ) {
+    return 0;
   }
 
-  return `${text.slice(0, max)}…`;
+  let overlap = 0;
+
+  for (const word of queryWords) {
+    if (candidateWords.has(word)) {
+      overlap++;
+    }
+  }
+
+  const union = new Set([
+    ...queryWords,
+    ...candidateWords,
+  ]).size;
+
+  if (!union) return 0;
+
+  return overlap / union;
 }
 
-/**
- * Remove accidental model reasoning / meta output.
- *
- * The model is instructed not to produce this, but this final layer
- * protects the actual chat UI if a provider/model does it anyway.
- */
-function sanitizeFinalReply(raw: string): string {
+/* ================================================================
+   REMOVE OBVIOUS MODEL META / REASONING
+================================================================ */
+
+function sanitizeReply(
+  raw: string,
+): string {
   let text = cleanText(raw);
 
   if (!text) {
@@ -114,16 +175,12 @@ function sanitizeFinalReply(raw: string): string {
   text = text.trim();
 
   text = text.replace(
-    /^(?:analysis|reasoning|thinking|internal reasoning)\s*:\s*/i,
+    /^(?:analysis|reasoning|thinking)\s*:\s*/i,
     "",
   );
 
-  /*
-   * If the model starts talking about being an AI/model or about
-   * retrieval, reject it instead of displaying it to the user.
-   */
   if (
-    /^(?:as an ai|as a language model|i am an ai|i'm an ai|i cannot reveal my reasoning|according to the dataset|according to the memories|based on the retrieved|based on the context)/i.test(
+    /^(?:as an ai|as a language model|i am an ai|according to the dataset|based on the context)/i.test(
       text,
     )
   ) {
@@ -133,53 +190,21 @@ function sanitizeFinalReply(raw: string): string {
   return text.trim();
 }
 
-/**
- * Remove duplicate retrieval rows while preserving ranking order.
- */
-function uniqueBy<T>(
-  rows: T[],
-  key: (row: T) => string,
-): T[] {
-  const seen = new Set<string>();
-  const result: T[] = [];
+/* ================================================================
+   PREVENT ECHOING THE USER
+================================================================ */
 
-  for (const row of rows) {
-    const value = key(row);
-
-    if (!value || seen.has(value)) {
-      continue;
-    }
-
-    seen.add(value);
-    result.push(row);
-  }
-
-  return result;
-}
-
-/**
- * Normalize whitespace for lightweight comparison.
- */
-function normalizeForComparison(value: string): string {
-  return value
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-/**
- * Detect an obvious copy/echo of the user's current message.
- *
- * This is deliberately conservative. We mainly want to prevent the
- * exact failure where the replica simply sends the user's own message
- * back unchanged.
- */
-function isObviousEcho(
+function looksLikeEcho(
   userMessage: string,
   reply: string,
 ): boolean {
-  const user = normalizeForComparison(userMessage);
-  const answer = normalizeForComparison(reply);
+  const user = normalizeText(
+    userMessage,
+  );
+
+  const answer = normalizeText(
+    reply,
+  );
 
   if (!user || !answer) {
     return false;
@@ -189,20 +214,16 @@ function isObviousEcho(
     return true;
   }
 
-  /*
-   * For longer messages, also catch a reply that is almost entirely
-   * the user's exact message.
-   */
   if (
-    user.length >= 25 &&
-    answer.length >= 25 &&
-    (answer.includes(user) || user.includes(answer))
+    answer.length >= user.length * 0.9 &&
+    answer.length <= user.length * 1.15
   ) {
-    const ratio =
-      Math.min(user.length, answer.length) /
-      Math.max(user.length, answer.length);
+    const score = similarityScore(
+      user,
+      answer,
+    );
 
-    if (ratio >= 0.92) {
+    if (score >= 0.85) {
       return true;
     }
   }
@@ -210,13 +231,16 @@ function isObviousEcho(
   return false;
 }
 
-/* =====================================================================
+/* ================================================================
    SERVER FUNCTION
-===================================================================== */
+================================================================ */
 
-export const generateReply = createServerFn({ method: "POST" })
-  .inputValidator((input: unknown) =>
-    generateSchema.parse(input),
+export const generateReply = createServerFn({
+  method: "POST",
+})
+  .inputValidator(
+    (input: unknown) =>
+      generateSchema.parse(input),
   )
   .handler(
     async ({
@@ -229,9 +253,9 @@ export const generateReply = createServerFn({ method: "POST" })
         "./firebase-verify.server"
       );
 
-      /* ================================================================
-         1. FIREBASE AUTHENTICATION
-      ================================================================ */
+      /* ============================================================
+         1. AUTHENTICATE USER
+      ============================================================ */
 
       let uid: string;
 
@@ -256,18 +280,18 @@ export const generateReply = createServerFn({ method: "POST" })
         };
       }
 
-      /* ================================================================
+      /* ============================================================
          2. USER-SCOPED SUPABASE
-      ================================================================ */
+      ============================================================ */
 
       const supabase =
         await createUserScopedSupabase(
           data.idToken,
         );
 
-      /* ================================================================
+      /* ============================================================
          3. VERIFY REPLICA OWNERSHIP
-      ================================================================ */
+      ============================================================ */
 
       const {
         data: replica,
@@ -277,7 +301,10 @@ export const generateReply = createServerFn({ method: "POST" })
         .select(
           "id, name, description, owner_id",
         )
-        .eq("id", data.replicaId)
+        .eq(
+          "id",
+          data.replicaId,
+        )
         .maybeSingle();
 
       if (replicaError) {
@@ -288,7 +315,8 @@ export const generateReply = createServerFn({ method: "POST" })
           generatedResponseId: null,
           usedMemories: 0,
           errorKind: "database",
-          error: replicaError.message,
+          error:
+            replicaError.message,
         };
       }
 
@@ -308,61 +336,9 @@ export const generateReply = createServerFn({ method: "POST" })
         };
       }
 
-      /* ================================================================
-         4. IDEMPOTENCY PROTECTION
-         
-         If the frontend accidentally sends the same request twice,
-         don't create two replica messages for the same user message.
-      ================================================================ */
-
-      if (data.replyToMessageId) {
-        const {
-          data: existingReply,
-          error: existingReplyError,
-        } = await supabase
-          .from("chat_session_messages")
-          .select(
-            "id, message_text, generated_response_id",
-          )
-          .eq(
-            "session_id",
-            data.sessionId,
-          )
-          .eq(
-            "reply_to_message_id",
-            data.replyToMessageId,
-          )
-          .eq(
-            "sender_role",
-            "replica",
-          )
-          .limit(1)
-          .maybeSingle();
-
-        if (
-          !existingReplyError &&
-          existingReply?.message_text
-        ) {
-          return {
-            ok: true,
-            reply:
-              existingReply.message_text,
-            messageId:
-              (existingReply.id as string) ??
-              null,
-            generatedResponseId:
-              (existingReply.generated_response_id as string) ??
-              null,
-            usedMemories: 0,
-          };
-        }
-      }
-
-      /* ================================================================
-         5. LOAD STYLE + PARTICIPANTS + HISTORY
-         
-         These are independent reads, so run them in parallel.
-      ================================================================ */
+      /* ============================================================
+         4. LOAD STYLE + PARTICIPANTS + RECENT CHAT
+      ============================================================ */
 
       const [
         styleResult,
@@ -370,7 +346,9 @@ export const generateReply = createServerFn({ method: "POST" })
         historyResult,
       ] = await Promise.all([
         supabase
-          .from("replica_style_profiles")
+          .from(
+            "replica_style_profiles",
+          )
           .select("*")
           .eq(
             "replica_id",
@@ -379,7 +357,9 @@ export const generateReply = createServerFn({ method: "POST" })
           .maybeSingle(),
 
         supabase
-          .from("replica_participants")
+          .from(
+            "replica_participants",
+          )
           .select(
             "display_name, role, message_count",
           )
@@ -393,10 +373,12 @@ export const generateReply = createServerFn({ method: "POST" })
               ascending: false,
             },
           )
-          .limit(6),
+          .limit(10),
 
         supabase
-          .from("chat_session_messages")
+          .from(
+            "chat_session_messages",
+          )
           .select(
             "sender_role, message_text, created_at",
           )
@@ -410,21 +392,21 @@ export const generateReply = createServerFn({ method: "POST" })
               ascending: false,
             },
           )
-          .limit(16),
+          .limit(20),
       ]);
 
-      const style = styleResult.data;
+      const style =
+        styleResult.data as StyleProfile | null;
 
       const participants =
         participantsResult.data ?? [];
 
       const history =
-        (historyResult.data ??
-          []) as ChatHistoryRow[];
+        historyResult.data ?? [];
 
-      /* ================================================================
-         6. DETERMINE REPLICA NAME
-      ================================================================ */
+      /* ============================================================
+         5. DETERMINE REPLICA NAME
+      ============================================================ */
 
       const replicaParticipant =
         participants.find(
@@ -434,18 +416,13 @@ export const generateReply = createServerFn({ method: "POST" })
         );
 
       const replicaName =
-        replicaParticipant?.display_name ??
+        replicaParticipant
+          ?.display_name ??
         replica.name;
 
-      /* ================================================================
-         7. RECENT CONVERSATION CONTEXT
-         
-         Recent history is used to understand the current situation.
-         
-         IMPORTANT:
-         It is NOT passed into the similarity RPC as the search query.
-         The similarity RPC receives the actual current user message.
-      ================================================================ */
+      /* ============================================================
+         6. BUILD RECENT CONVERSATION CONTEXT
+      ============================================================ */
 
       const recentHistory =
         history
@@ -468,97 +445,184 @@ export const generateReply = createServerFn({ method: "POST" })
                 "replica"
                   ? "REPLICA"
                   : "USER"
-              }: ${clampText(
-                row.message_text,
-                450,
+              }: ${clamp(
+                cleanText(
+                  row.message_text,
+                ),
+                500,
               )}`,
           )
           .join("\n");
 
-      /* ================================================================
-         8. RETRIEVE AUTHENTIC DATA
+      /* ============================================================
+         7. PREPARE SEARCH TERMS
          
-         This is the most important part.
-         
-         Current message
-                ↓
-         search_similar_exchanges
-                ↓
-         historical USER message + actual REPLICA reply
-         
-         That pair is the strongest evidence for how this person
-         responds in a similar situation.
-      ================================================================ */
+         We intentionally search historical USER messages.
+         The critical relationship is:
 
-      const [
-        exchangeResult,
-        replicaMessageResult,
-        memoryResult,
-      ] = await Promise.all([
-        supabase.rpc(
-          "search_similar_exchanges",
-          {
-            p_replica_id:
-              data.replicaId,
+         HISTORICAL USER MESSAGE
+                    ↓
+         HISTORICAL REPLICA RESPONSE
 
-            /*
-             * VERY IMPORTANT:
-             * Search using the actual user message.
-             *
-             * Do NOT use recentContext here.
-             */
-            p_query:
-              data.message,
+         This prevents the previous bug where the system found:
+         "Teri yad arhi"
 
-            p_limit: 10,
-          },
-        ),
+         and then treated that USER message itself as an answer.
+      ============================================================ */
 
-        supabase.rpc(
-          "search_replica_messages",
-          {
-            p_replica_id:
-              data.replicaId,
-
-            p_query:
-              data.message,
-
-            p_limit: 10,
-          },
-        ),
-
-        supabase.rpc(
-          "search_memories",
-          {
-            p_replica_id:
-              data.replicaId,
-
-            p_query:
-              data.message,
-
-            p_limit: 8,
-          },
-        ),
-      ]);
-
-      const similarExchanges =
-        (
-          (exchangeResult.data ??
-            []) as RetrievalExchange[]
-        ).filter(
-          (row) =>
-            cleanText(
-              row.prompt_text,
-            ) &&
-            cleanText(
-              row.reply_text,
-            ),
+      const normalizedUserMessage =
+        normalizeText(
+          data.message,
         );
 
-      const replicaMessages =
-        (
-          (replicaMessageResult.data ??
-            []) as RetrievedMessage[]
+      const searchWords =
+        tokenize(
+          data.message,
+        )
+          .filter(
+            (word) =>
+              word.length >= 3,
+          )
+          .slice(0, 8);
+
+      /* ============================================================
+         8. LOAD HISTORICAL USER MESSAGES
+         
+         IMPORTANT:
+         sender_role = "me" means the original chat sender.
+         
+         We retrieve those messages first, then locate the replica
+         response associated with them.
+      ============================================================ */
+
+      let historicalCandidates:
+        HistoricalMessage[] = [];
+
+      if (
+        searchWords.length > 0
+      ) {
+        const searchPattern =
+          searchWords
+            .map(
+              (word) =>
+                `%${word}%`,
+            );
+
+        const candidateQueries =
+          searchPattern
+            .slice(0, 4)
+            .map(
+              (pattern) =>
+                supabase
+                  .from("messages")
+                  .select(
+                    "id, sender_role, sender_name, message_text, reply_to_message_id, sent_at",
+                  )
+                  .eq(
+                    "replica_id",
+                    data.replicaId,
+                  )
+                  .eq(
+                    "sender_role",
+                    "me",
+                  )
+                  .ilike(
+                    "message_text",
+                    pattern,
+                  )
+                  .not(
+                    "message_text",
+                    "is",
+                    null,
+                  )
+                  .order(
+                    "sent_at",
+                    {
+                      ascending: false,
+                    },
+                  )
+                  .limit(40),
+            );
+
+        const candidateResults =
+          await Promise.all(
+            candidateQueries,
+          );
+
+        for (const result of candidateResults) {
+          if (
+            result.data
+          ) {
+            historicalCandidates.push(
+              ...(result.data as HistoricalMessage[]),
+            );
+          }
+        }
+      }
+
+      /* ============================================================
+         9. FALLBACK CANDIDATE SEARCH
+         
+         If keyword search finds nothing, use recent messages from
+         this replica as a fallback. This is still restricted to
+         USER messages.
+      ============================================================ */
+
+      if (
+        historicalCandidates.length ===
+        0
+      ) {
+        const {
+          data: fallbackRows,
+        } = await supabase
+          .from("messages")
+          .select(
+            "id, sender_role, sender_name, message_text, reply_to_message_id, sent_at",
+          )
+          .eq(
+            "replica_id",
+            data.replicaId,
+          )
+          .eq(
+            "sender_role",
+            "me",
+          )
+          .not(
+            "message_text",
+            "is",
+            null,
+          )
+          .order(
+            "sent_at",
+            {
+              ascending: false,
+            },
+          )
+          .limit(80);
+
+        historicalCandidates =
+          (fallbackRows ??
+            []) as HistoricalMessage[];
+      }
+
+      /* ============================================================
+         10. DEDUPLICATE USER CANDIDATES
+      ============================================================ */
+
+      const uniqueCandidates =
+        Array.from(
+          new Map(
+            historicalCandidates.map(
+              (row) => [
+                normalizeText(
+                  cleanText(
+                    row.message_text,
+                  ),
+                ),
+                row,
+              ],
+            ),
+          ).values(),
         ).filter(
           (row) =>
             cleanText(
@@ -566,407 +630,563 @@ export const generateReply = createServerFn({ method: "POST" })
             ),
         );
 
-      const memoryHits =
-        (
-          (memoryResult.data ??
-            []) as RetrievedMemory[]
-        ).filter(
+      /* ============================================================
+         11. RANK HISTORICAL USER MESSAGES
+      ============================================================ */
+
+      const rankedCandidates =
+        uniqueCandidates
+          .map(
+            (row) => ({
+              row,
+              similarity:
+                similarityScore(
+                  data.message,
+                  cleanText(
+                    row.message_text,
+                  ),
+                ),
+            }),
+          )
+          .sort(
+            (a, b) =>
+              b.similarity -
+              a.similarity,
+          )
+          .slice(0, 20);
+
+      /* ============================================================
+         PART 1 ENDS HERE
+         
+         NEXT PART CONTINUES WITH:
+         - finding actual replica replies
+         - pairing USER → REPLICA exchanges
+         - memories
+         - style
+         - OpenRouter prompt
+         - generation
+      ============================================================ */    /* ================================================================
+       7. BUILD RETRIEVAL QUERY
+    ================================================================= */
+
+    const recentHistory = (history ?? [])
+      .slice()
+      .reverse()
+      .filter((row) => cleanText(row.message_text));
+
+    const recentContext = recentHistory
+      .slice(-8)
+      .map((row) => {
+        const role =
+          row.sender_role === "replica"
+            ? "REPLICA"
+            : "USER";
+
+        return `${role}: ${clampText(
+          cleanText(row.message_text),
+          500,
+        )}`;
+      })
+      .join("\n");
+
+    const retrievalQuery = [
+      recentContext
+        ? `Recent conversation:\n${recentContext}`
+        : "",
+      `Current message:\n${cleanText(data.message)}`,
+    ]
+      .filter(Boolean)
+      .join("\n\n");
+
+    /* ================================================================
+       8. RETRIEVE ACTUAL HISTORICAL EXCHANGES
+
+       MOST IMPORTANT PART:
+
+       We want:
+
+       USER MESSAGE / SITUATION
+                    ↓
+       ACTUAL REPLICA RESPONSE
+
+       The model should learn from the response that the replica
+       actually gave in a similar situation.
+
+       We do NOT want random replica messages to become answers.
+    ================================================================= */
+
+    const [
+      exchangeResult,
+      replicaMessageResult,
+      memoryResult,
+    ] = await Promise.all([
+      supabase.rpc(
+        "search_similar_exchanges",
+        {
+          p_replica_id: data.replicaId,
+          p_query: retrievalQuery,
+          p_limit: 12,
+        },
+      ),
+
+      supabase.rpc(
+        "search_replica_messages",
+        {
+          p_replica_id: data.replicaId,
+          p_query: cleanText(data.message),
+          p_limit: 10,
+        },
+      ),
+
+      supabase.rpc(
+        "search_memories",
+        {
+          p_replica_id: data.replicaId,
+          p_query: cleanText(data.message),
+          p_limit: 8,
+        },
+      ),
+    ]);
+
+    /*
+     * Retrieval errors are not immediately fatal.
+     *
+     * A retrieval RPC can fail while the rest of the chat system is
+     * perfectly usable. We therefore keep whatever retrieval succeeded
+     * and let the model use the conversation + style profile.
+     */
+
+    if (exchangeResult.error) {
+      console.error(
+        "[retrieval] search_similar_exchanges:",
+        exchangeResult.error.message,
+      );
+    }
+
+    if (replicaMessageResult.error) {
+      console.error(
+        "[retrieval] search_replica_messages:",
+        replicaMessageResult.error.message,
+      );
+    }
+
+    if (memoryResult.error) {
+      console.error(
+        "[retrieval] search_memories:",
+        memoryResult.error.message,
+      );
+    }
+
+    const similarExchanges =
+      ((exchangeResult.data ?? []) as RetrievalExchange[])
+        .filter(
           (row) =>
-            cleanText(row.title) ||
-            cleanText(
-              row.description,
-            ),
+            cleanText(row.prompt_text) &&
+            cleanText(row.reply_text),
         );
 
-      /* ================================================================
-         9. REMOVE DUPLICATES
-      ================================================================ */
+    const replicaMessages =
+      ((replicaMessageResult.data ?? []) as RetrievedMessage[])
+        .filter((row) =>
+          cleanText(row.message_text),
+        );
 
-      const uniqueExchanges =
-        uniqueBy(
-          similarExchanges,
+    const memoryHits =
+      ((memoryResult.data ?? []) as RetrievedMemory[])
+        .filter(
           (row) =>
-            `${normalizeForComparison(
-              cleanText(
-                row.prompt_text,
-              ),
-            )}|||${normalizeForComparison(
-              cleanText(
-                row.reply_text,
-              ),
-            )}`,
-        ).slice(0, 8);
+            cleanText(row.title) ||
+            cleanText(row.description),
+        );
 
-      const uniqueReplicaMessages =
-        uniqueBy(
-          replicaMessages,
-          (row) =>
-            normalizeForComparison(
-              cleanText(
-                row.message_text,
-              ),
-            ),
-        ).slice(0, 10);
+    /* ================================================================
+       9. RANK / DEDUPLICATE HISTORICAL EXCHANGES
 
-      /* ================================================================
-         10. STYLE PROFILE
-      ================================================================ */
+       Never simply take the first random result.
 
-      const vocabularyProfile =
-        style?.vocabulary_profile as
-          | {
-              signature_phrases?: unknown;
-            }
-          | null
-          | undefined;
+       We prioritize:
+       - high similarity
+       - actual USER → REPLICA pair
+       - useful response length
+       - unique examples
 
-      const styleSummary = style
-        ? JSON.stringify(
-            {
-              language:
-                style.language_profile,
+       This is what prevents a message like:
 
-              emoji:
-                style.emoji_profile,
+       "What's your name"
 
-              punctuation:
-                style.punctuation_profile,
+       from being answered with some unrelated historical
+       "Pidde" message just because both exist in the database.
+    ================================================================= */
 
-              response_length:
-                style.response_length_profile,
+    const rankedExchanges = uniqueBy(
+      similarExchanges,
+      (row) =>
+        `${cleanText(row.prompt_text)}|||${cleanText(
+          row.reply_text,
+        )}`,
+    )
+      .map((row) => {
+        const similarity =
+          typeof row.similarity === "number"
+            ? row.similarity
+            : 0;
 
-              greetings:
-                style.greeting_profile,
+        const promptLength =
+          cleanText(row.prompt_text).length;
 
-              humor:
-                style.humor_profile,
+        const replyLength =
+          cleanText(row.reply_text).length;
 
-              vocabulary:
-                vocabularyProfile
-                  ?.signature_phrases,
-            },
-          ).slice(0, 4500)
-        : "No measured style profile is available.";
+        /*
+         * Very short historical messages are still useful, but they
+         * should not dominate retrieval simply because they are short.
+         */
+        let qualityBonus = 0;
 
-      /* ================================================================
-         11. BUILD HISTORICAL EXCHANGE EVIDENCE
-      ================================================================ */
+        if (promptLength >= 3) {
+          qualityBonus += 0.02;
+        }
 
-      const exchangeEvidence =
-        uniqueExchanges.length
-          ? uniqueExchanges
-              .map(
-                (
-                  row,
-                  index,
-                ) =>
-                  `[HISTORICAL EXCHANGE ${
-                    index + 1
-                  }]
+        if (replyLength >= 2) {
+          qualityBonus += 0.02;
+        }
+
+        return {
+          ...row,
+          retrievalScore:
+            similarity + qualityBonus,
+        };
+      })
+      .sort(
+        (a, b) =>
+          b.retrievalScore -
+          a.retrievalScore,
+      )
+      .slice(0, 8);
+
+    const uniqueReplicaMessages = uniqueBy(
+      replicaMessages,
+      (row) =>
+        cleanText(row.message_text),
+    ).slice(0, 10);
+
+    /* ================================================================
+       10. DETECT WHETHER WE HAVE A STRONG MATCH
+
+       IMPORTANT:
+
+       If the database doesn't have a sufficiently similar exchange,
+       we should NOT pretend that a random historical answer is the
+       correct answer.
+
+       Instead, the model gets the conversation + style + memories and
+       is told to answer naturally.
+    ================================================================= */
+
+    const strongestSimilarity =
+      rankedExchanges.length > 0 &&
+      typeof rankedExchanges[0].similarity ===
+        "number"
+        ? rankedExchanges[0].similarity
+        : 0;
+
+    const hasStrongHistoricalMatch =
+      strongestSimilarity >= 0.45;
+
+    const hasUsableHistoricalMatch =
+      strongestSimilarity >= 0.30;
+
+    /* ================================================================
+       11. STYLE PROFILE
+    ================================================================= */
+
+    const styleSummary = style
+      ? JSON.stringify(
+          {
+            language:
+              style.language_profile,
+
+            emoji:
+              style.emoji_profile,
+
+            punctuation:
+              style.punctuation_profile,
+
+            response_length:
+              style.response_length_profile,
+
+            greetings:
+              style.greeting_profile,
+
+            humor:
+              style.humor_profile,
+
+            vocabulary:
+              (
+                style.vocabulary_profile as {
+                  signature_phrases?: unknown;
+                }
+              )?.signature_phrases,
+          },
+        ).slice(0, 5000)
+      : "No measured style profile is available.";
+
+    /* ================================================================
+       12. BUILD HISTORICAL EVIDENCE
+    ================================================================= */
+
+    const exchangeEvidence =
+      rankedExchanges.length
+        ? rankedExchanges
+            .map(
+              (row, index) =>
+                `[HISTORICAL EXCHANGE ${index + 1}]
 USER MESSAGE:
 ${clampText(
-  row.prompt_text,
-  550,
+  cleanText(row.prompt_text),
+  700,
 )}
 
-REPLICA'S ACTUAL REPLY:
+ACTUAL REPLICA RESPONSE:
 ${clampText(
-  row.reply_text,
-  550,
+  cleanText(row.reply_text),
+  700,
 )}
 
 SIMILARITY:
 ${
-  typeof row.similarity ===
-  "number"
-    ? row.similarity.toFixed(
-        3,
-      )
+  typeof row.similarity === "number"
+    ? row.similarity.toFixed(3)
     : "unknown"
 }`,
-              )
-              .join(
-                "\n\n",
-              )
-          : "No directly similar historical exchange was retrieved.";
+            )
+            .join("\n\n")
+        : "NO SIMILAR HISTORICAL EXCHANGE FOUND.";
 
-      /* ================================================================
-         12. BUILD AUTHENTIC MESSAGE EVIDENCE
-      ================================================================ */
-
-      const messageEvidence =
-        uniqueReplicaMessages.length
-          ? uniqueReplicaMessages
-              .map(
-                (
-                  row,
-                  index,
-                ) =>
-                  `${index + 1}. ${clampText(
+    const messageEvidence =
+      uniqueReplicaMessages.length
+        ? uniqueReplicaMessages
+            .map(
+              (row, index) =>
+                `${index + 1}. ${clampText(
+                  cleanText(
                     row.message_text,
-                    300,
-                  )}`,
-              )
-              .join("\n")
-          : "No additional authentic replica messages were retrieved.";
+                  ),
+                  300,
+                )}`,
+            )
+            .join("\n")
+        : "NO ADDITIONAL REPLICA MESSAGES FOUND.";
 
-      /* ================================================================
-         13. BUILD MEMORY EVIDENCE
-      ================================================================ */
-
-      const memoryEvidence =
-        memoryHits.length
-          ? memoryHits
-              .slice(0, 8)
-              .map(
-                (
-                  memory,
-                  index,
-                ) =>
-                  `${index + 1}. ${
-                    cleanText(
-                      memory.title,
-                    ) ||
-                    "Memory"
-                  }: ${clampText(
+    const memoryEvidence =
+      memoryHits.length
+        ? memoryHits
+            .slice(0, 8)
+            .map(
+              (memory, index) =>
+                `${index + 1}. ${
+                  cleanText(memory.title) ||
+                  "Memory"
+                }: ${clampText(
+                  cleanText(
                     memory.description,
-                    450,
-                  )}`,
-              )
-              .join("\n")
-          : "No relevant stored memories were retrieved.";
+                  ),
+                  500,
+                )}`,
+            )
+            .join("\n")
+        : "NO RELEVANT MEMORIES FOUND.";
 
-      /* ================================================================
-         14. OPENROUTER CONFIG
-      ================================================================ */
+    /* ================================================================
+       13. SYSTEM PROMPT
+    ================================================================= */
 
-      const apiKey =
-        process.env[
-          "OPENROUTER_API_KEY"
-        ];
-
-      if (!apiKey) {
-        return {
-          ok: false,
-          reply: "",
-          messageId: null,
-          generatedResponseId: null,
-          usedMemories:
-            memoryHits.length,
-          errorKind: "grok",
-          error:
-            "The AI backend is not configured (missing OPENROUTER_API_KEY).",
-        };
-      }
-
-      /* ================================================================
-         15. SYSTEM PROMPT
-      ================================================================ */
-
-      const systemPrompt = `
-You are the conversational replica of "${replicaName}".
-
-Your ONLY job is to produce the single message that this person would
-most naturally send in response to the user's CURRENT message.
+    const systemPrompt = `
+You are "${replicaName}" having a normal personal chat.
 
 You are NOT a generic AI assistant.
 
-You are NOT supposed to answer the question in a generic helpful way.
+Your task is to produce the ONE message that this person would most
+naturally send in response to the user's CURRENT message.
 
-You must imitate the person's actual conversational behavior from the
+==================================================
+MOST IMPORTANT RULE: SITUATION → HISTORICAL RESPONSE
+==================================================
+
+The historical dataset contains real examples of:
+
+USER MESSAGE / SITUATION
+        ↓
+ACTUAL REPLICA RESPONSE
+
+Use those pairs as the strongest evidence of how this person responds.
+
+Do NOT simply copy the user's message.
+
+Do NOT simply select a random replica message.
+
+Do NOT take a historical response out of context.
+
+Instead:
+
+1. Understand the CURRENT user's message.
+2. Understand the recent conversation.
+3. Determine the intent, emotion, topic and situation.
+4. Look at the historical USER → REPLICA exchanges.
+5. Find exchanges with the same or closely related situation.
+6. Study what the replica actually replied there.
+7. Adapt the closest authentic response to the CURRENT situation.
+8. Preserve the person's natural language and personality.
+9. Return ONE final conversational response.
+
+==================================================
+CRITICAL ANTI-COPY RULE
+==================================================
+
+NEVER return the user's current message as the replica's response.
+
+NEVER echo the user's message merely because it appears in the
 historical dataset.
 
+For example, if the user says:
+
+"Teri yad arhi"
+
+and the database contains old messages where the USER said:
+
+"Teri yad arhi"
+
+those old USER messages are NOT replica answers.
+
+You must use the corresponding historical REPLICA responses from those
+situations.
+
+The direction of the conversation matters:
+
+USER → REPLICA
+
+not:
+
+USER → USER
+
 ==================================================
-MOST IMPORTANT RULE: HISTORICAL RESPONSE MATCHING
+HISTORICAL MATCHING
 ==================================================
 
-The database contains historical conversations from this person.
+A historical exchange is useful when its USER MESSAGE has a similar:
 
-Each useful historical exchange has:
+- meaning
+- intent
+- topic
+- emotional state
+- conversational purpose
+- question type
+- request type
+- teasing pattern
+- affectionate pattern
+- casual context
 
-USER MESSAGE
-+
-THE REPLICA PERSON'S ACTUAL REPLY
+Semantic similarity alone is NOT enough.
 
-Those historical USER → REPLICA pairs are your strongest evidence.
+A message should not be treated as a good match merely because it
+shares one word such as:
 
-For the current user message:
-
-1. Understand what the user means.
-2. Understand the emotional and conversational situation.
-3. Examine the historical exchanges.
-4. Find the exchange whose SITUATION and INTENT are closest.
-5. Examine how the replica actually replied there.
-6. Use that response pattern as the primary template.
-7. Adapt it naturally to the current situation.
-8. Preserve the person's actual style and wording whenever appropriate.
-9. Return ONE final response.
-
-Do NOT simply choose the message with the most similar words.
-
-A semantically similar situation is more important than a keyword match.
+"yad"
+"pidde"
+"name"
+"acha"
+"haan"
 
 For example:
 
-If the user says something affectionate and the dataset contains
-multiple affectionate exchanges, use the actual affectionate response
-patterns.
+"What's your name?"
 
-If the user is teasing, prefer historical teasing responses.
+should not retrieve an unrelated response just because some historical
+message contains "name".
 
-If the user is asking a question, prefer historical responses to similar
-questions.
-
-If the user says something short and casual, prefer short casual
-historical replies.
-
-If the user is emotional, use historical emotional-response behavior.
-
-==================================================
-CRITICAL ANTI-ECHO RULE
-==================================================
-
-NEVER send the user's current message back to them.
-
-NEVER simply copy the current user message.
-
-The user's current message is INPUT.
-
-The replica's response must be OUTPUT.
-
-Even if a historical user message looks almost identical to the current
-message, do NOT output the historical USER MESSAGE.
-
-Only the historical REPLICA'S ACTUAL REPLY can be used as a response
-example.
-
-If the current user says:
-
-"Teri yad ari"
-
-and the database contains:
-
-USER:
-"Teri yad arhi"
-
-REPLICA:
-"..." 
-
-then the answer must be based on the REPLICA response, NOT on the user's
-"Teri yad arhi" message.
-
-==================================================
-CONVERSATIONAL CONTEXT
-==================================================
-
-Use recent conversation history to understand references and meaning.
-
-Words such as:
-
-"acha"
-"haan"
-"sun"
-"oye"
-"that"
-"this"
-"him"
-"her"
-"there"
-"kyu"
-"ku"
-"bss"
-"piddi"
-etc.
-
-may depend completely on previous messages.
-
-Do not treat the current message as isolated when recent conversation
-changes its meaning.
-
-==================================================
-STYLE FIDELITY
-==================================================
-
-Match the person's:
-
-- Urdu / Roman Urdu / English mix
-- slang
-- spelling
-- abbreviations
-- sentence structure
-- message length
-- punctuation
-- capitalization
-- emojis
-- repeated phrases
-- teasing
-- humor
-- affection
-- sarcasm
-- conversational rhythm
-- use of nicknames
-- degree of formality
-
-Do NOT make the response cleaner, more formal, or more grammatically
-correct than the person's actual historical style.
-
-If their historical messages are short, stay short.
-
-If they commonly use emojis, use them naturally.
-
-If they commonly use Roman Urdu, use Roman Urdu.
-
-If they mix English and Urdu, preserve that mix.
-
-Do not force a style feature into every answer.
-
-==================================================
-PERSONAL FACTS
-==================================================
-
-Only use facts supported by:
-
-- historical exchanges
-- recent chat history
-- retrieved memories
-- replica description
-- measured style profile
-
-Never invent:
-
-- events
-- memories
-- relationships
-- locations
-- schedules
-- personal history
-- feelings
-- promises
-- conversations
+Always consider the complete situation.
 
 ==================================================
 WHEN THERE IS NO GOOD MATCH
 ==================================================
 
-If there is no highly similar historical exchange:
+If there is no sufficiently similar historical exchange:
 
-1. Use the person's authentic replica messages.
-2. Use the style profile.
-3. Use relevant memories.
-4. Use recent conversation context.
-5. Infer the most natural response consistent with the person's
-   established behavior.
+DO NOT force an unrelated historical response.
 
-Do NOT produce a generic ChatGPT answer.
+Instead generate a natural response using:
+
+1. recent conversation
+2. replica style profile
+3. replica description
+4. relevant memories
+5. authentic replica wording patterns
+
+The answer should still sound like the person.
 
 ==================================================
-RETRIEVED HISTORICAL EXCHANGES
+WHEN THERE IS A STRONG MATCH
+==================================================
+
+If a strong historical exchange exists:
+
+Use it as the primary behavioral template.
+
+You may reuse its wording when it naturally fits.
+
+You may shorten it, adapt it, change names/pronouns, or adjust it to
+the current context.
+
+Do NOT blindly copy it when the current situation is different.
+
+==================================================
+CONVERSATION CONTEXT
+==================================================
+
+Recent conversation:
+
+${recentContext || "No recent conversation available."}
+
+The current message is:
+
+"${cleanText(data.message)}"
+
+The current message must always be treated as the newest user message.
+
+==================================================
+REPLICA IDENTITY
+==================================================
+
+Replica name:
+${replicaName}
+
+Replica description:
+${cleanText(replica.description) || "No description available."}
+
+==================================================
+MEASURED STYLE
+==================================================
+
+${styleSummary}
+
+==================================================
+OWNER INSTRUCTIONS
+==================================================
+
+${
+  cleanText(style?.custom_instructions)
+    ? cleanText(style?.custom_instructions)
+    : "No additional owner instructions."
+}
+
+==================================================
+BEST HISTORICAL USER → REPLICA EXAMPLES
 ==================================================
 
 ${exchangeEvidence}
 
 ==================================================
-AUTHENTIC REPLICA MESSAGES
+ADDITIONAL AUTHENTIC REPLICA MESSAGES
 ==================================================
 
 ${messageEvidence}
@@ -978,485 +1198,301 @@ RELEVANT MEMORIES
 ${memoryEvidence}
 
 ==================================================
-MEASURED STYLE PROFILE
+RETRIEVAL STATUS
 ==================================================
 
-${styleSummary}
+Strong historical match:
+${hasStrongHistoricalMatch ? "YES" : "NO"}
+
+Usable historical match:
+${hasUsableHistoricalMatch ? "YES" : "NO"}
+
+Strongest similarity:
+${strongestSimilarity.toFixed(3)}
 
 ==================================================
-OWNER INSTRUCTIONS
+NATURAL CHAT RULES
 ==================================================
 
-${
-  cleanText(
-    style?.custom_instructions,
-  ) ||
-  "No additional owner instructions."
-}
+Reply like a real person texting.
+
+Do not sound like an assistant.
+
+Do not over-explain.
+
+Do not automatically use complete formal sentences.
+
+Do not repeat the user's message.
+
+Do not answer with generic phrases.
+
+Match the person's:
+
+- Urdu/Hinglish/English mix
+- spelling
+- slang
+- vocabulary
+- punctuation
+- capitalization
+- emoji usage
+- humor
+- affection
+- teasing
+- sentence length
+- response length
+- conversational rhythm
+
+If their normal response is short, be short.
+
+If their normal response is playful, be playful.
+
+If their normal response is teasing, tease naturally.
+
+If the situation is serious, respond appropriately.
+
+Do not force emojis or nicknames into every message.
+
+==================================================
+PERSONAL FACTS
+==================================================
+
+Only use facts supported by the supplied evidence.
+
+Never invent:
+
+- events
+- memories
+- relationships
+- locations
+- schedules
+- conversations
+- personal history
 
 ==================================================
 FINAL OUTPUT
 ==================================================
 
-Return ONLY the exact final conversational message the replica should
-send.
+Return ONLY the final message the replica would send.
 
-ONE response.
+No explanation.
 
 No reasoning.
 
 No analysis.
 
-No explanation.
-
-No candidate responses.
-
-No confidence score.
-
 No labels.
 
 No JSON.
 
-No markdown explanation.
+No markdown.
 
-No dataset references.
+No candidate responses.
 
-No memory references.
+No "Analysis:".
 
-No mention of AI.
+No "Reasoning:".
 
-No mention of OpenRouter.
+No <think>.
 
-No mention of being a replica.
+No meta commentary.
 
-Do not repeat the user's current message.
-
-Do not quote the user's current message unless the person's natural
-historical conversational style clearly requires quoting a tiny part of
-it.
-
-The final output must be ready to display directly in the chat UI.
-
-Stay completely in character.
+ONE FINAL CHAT MESSAGE ONLY.
 `.trim();
 
-      /* ================================================================
-         16. MODEL CHAT HISTORY
-      ================================================================ */
+    /* ================================================================
+       14. BUILD MODEL HISTORY
+    ================================================================= */
 
-      const modelHistory =
-        recentHistory
-          .slice(-10)
-          .map(
-            (row) => ({
-              role:
-                row.sender_role ===
-                "replica"
-                  ? ("assistant" as const)
-                  : ("user" as const),
+    const modelHistory = recentHistory
+      .slice(-12)
+      .map((row) => ({
+        role:
+          row.sender_role === "replica"
+            ? "assistant"
+            : "user",
 
-              content:
-                cleanText(
-                  row.message_text,
-                ),
-            }),
-          )
-          .filter(
-            (row) =>
-              row.content,
-          );
+        content: cleanText(
+          row.message_text,
+        ),
+      }))
+      .filter(
+        (row) => row.content,
+      );
 
-      const messages = [
-        {
-          role: "system" as const,
-          content: systemPrompt,
-        },
+    const messages = [
+      {
+        role: "system" as const,
+        content: systemPrompt,
+      },
 
-        ...modelHistory,
+      ...modelHistory,
 
-        {
-          role: "user" as const,
-          content: data.message,
-        },
-      ];      /* ================================================================
-         17. GENERATE RESPONSE
-         
-         Fast + faithful:
-         - low temperature
-         - short output limit
-         - reasoning excluded
-         - only one retry for transient failures
-      ================================================================ */
+      {
+        role: "user" as const,
+        content: cleanText(
+          data.message,
+        ),
+      },
+    ];
 
-      let reply = "";
+    /* ================================================================
+       15. OPENROUTER CONFIGURATION
+    ================================================================= */
 
-      let openRouterMeta: Record<
-        string,
-        unknown
-      > = {};
+    const apiKey =
+      process.env["OPENROUTER_API_KEY"];
 
-      const attemptLimit = 2;
+    if (!apiKey) {
+      return {
+        ok: false,
+        reply: "",
+        messageId: null,
+        generatedResponseId: null,
+        usedMemories:
+          memoryHits.length,
+        errorKind: "grok",
+        error:
+          "The AI backend is not configured (missing OPENROUTER_API_KEY).",
+      };
+    }
 
-      for (
-        let attempt = 1;
-        attempt <= attemptLimit;
-        attempt += 1
-      ) {
-        const controller =
-          new AbortController();
+    /* ================================================================
+       16. GENERATE FINAL RESPONSE
+    ================================================================= */
 
-        /*
-         * 30 seconds keeps the chat responsive while still allowing
-         * the model enough time to answer.
-         */
-        const timeout =
-          setTimeout(
-            () =>
-              controller.abort(),
-            30_000,
-          );
+    let reply = "";
 
-        try {
-          const response =
-            await fetch(
-              "https://openrouter.ai/api/v1/chat/completions",
-              {
-                method: "POST",
+    let openRouterMeta: Record<
+      string,
+      unknown
+    > = {};
 
-                headers: {
-                  "Content-Type":
-                    "application/json",
+    const attemptLimit = 2;
 
-                  Authorization:
-                    `Bearer ${apiKey}`,
+    for (
+      let attempt = 1;
+      attempt <= attemptLimit;
+      attempt += 1
+    ) {
+      const controller =
+        new AbortController();
 
-                  "HTTP-Referer":
-                    "https://always-together.vercel.app",
+      const timeout = setTimeout(
+        () => controller.abort(),
+        35_000,
+      );
 
-                  "X-Title":
-                    "Always Together",
-                },
+      try {
+        const response = await fetch(
+          "https://openrouter.ai/api/v1/chat/completions",
+          {
+            method: "POST",
 
-                body: JSON.stringify({
-                  model:
-                    "openrouter/free",
+            headers: {
+              "Content-Type":
+                "application/json",
 
-                  messages,
+              Authorization:
+                `Bearer ${apiKey}`,
 
-                  /*
-                   * Lower temperature makes the model follow the
-                   * retrieved historical behavior more consistently
-                   * instead of inventing a new personality.
-                   */
-                  temperature:
-                    0.45,
+              "HTTP-Referer":
+                "https://always-together.vercel.app",
 
-                  top_p: 0.9,
-
-                  /*
-                   * Replica replies should normally be conversational,
-                   * so there is no reason to allow huge outputs.
-                   */
-                  max_tokens:
-                    350,
-
-                  /*
-                   * OpenRouter supports reasoning controls. We do not
-                   * want reasoning returned as the chat response.
-                   */
-                  reasoning: {
-                    enabled: false,
-                    exclude: true,
-                  },
-                }),
-
-                signal:
-                  controller.signal,
-              },
-            );
-
-          clearTimeout(
-            timeout,
-          );
-
-          /* ------------------------------------------------------------
-             RATE LIMIT
-          ------------------------------------------------------------ */
-
-          if (
-            response.status ===
-            429
-          ) {
-            if (
-              attempt <
-              attemptLimit
-            ) {
-              await new Promise(
-                (resolve) =>
-                  setTimeout(
-                    resolve,
-                    900,
-                  ),
-              );
-
-              continue;
-            }
-
-            return {
-              ok: false,
-              reply: "",
-              messageId: null,
-              generatedResponseId:
-                null,
-              usedMemories:
-                memoryHits.length,
-              errorKind:
-                "rate_limit",
-              error:
-                "OpenRouter is rate limiting requests right now. Try again in a moment.",
-            };
-          }
-
-          /* ------------------------------------------------------------
-             TRANSIENT SERVER ERRORS
-          ------------------------------------------------------------ */
-
-          if (
-            !response.ok
-          ) {
-            const body =
-              await response.text();
-
-            console.error(
-              `[openrouter] ${response.status}: ${body}`,
-            );
-
-            /*
-             * Retry only server-side failures.
-             * Do not waste time retrying authentication/request errors.
-             */
-            if (
-              attempt <
-                attemptLimit &&
-              response.status >=
-                500
-            ) {
-              await new Promise(
-                (resolve) =>
-                  setTimeout(
-                    resolve,
-                    500,
-                  ),
-              );
-
-              continue;
-            }
-
-            let readableError =
-              `The AI service returned an error (${response.status}).`;
-
-            try {
-              const parsed =
-                JSON.parse(
-                  body,
-                ) as {
-                  error?: {
-                    message?: string;
-                  };
-                };
-
-              if (
-                parsed?.error
-                  ?.message
-              ) {
-                readableError =
-                  `OpenRouter: ${parsed.error.message}`;
-              }
-            } catch {
-              // Keep generic error.
-            }
-
-            return {
-              ok: false,
-              reply: "",
-              messageId: null,
-              generatedResponseId:
-                null,
-              usedMemories:
-                memoryHits.length,
-              errorKind:
-                "grok",
-              error:
-                readableError,
-            };
-          }
-
-          /* ------------------------------------------------------------
-             PARSE RESPONSE
-          ------------------------------------------------------------ */
-
-          const payload =
-            (await response.json()) as {
-              choices?: {
-                message?: {
-                  content?: string;
-                };
-              }[];
-
-              usage?: Record<
-                string,
-                unknown
-              >;
-
-              model?: string;
-
-              id?: string;
-            };
-
-          const rawReply =
-            payload
-              .choices?.[0]
-              ?.message
-              ?.content ??
-            "";
-
-          reply =
-            sanitizeFinalReply(
-              rawReply,
-            );
-
-          openRouterMeta = {
-            provider:
-              "openrouter",
-
-            model:
-              payload.model ??
-              "openrouter/free",
-
-            request_id:
-              payload.id ??
-              null,
-
-            usage:
-              payload.usage ??
-              {},
-
-            attempt,
-
-            retrieval: {
-              similar_exchanges:
-                uniqueExchanges.length,
-
-              authentic_messages:
-                uniqueReplicaMessages.length,
-
-              memories:
-                memoryHits.length,
-
-              /*
-               * Useful when diagnosing retrieval quality.
-               */
-              current_message:
-                data.message,
+              "X-Title":
+                "Always Together",
             },
 
-            reasoning_excluded:
-              true,
-          };
+            body: JSON.stringify({
+              model: "openrouter/free",
 
-          /* ------------------------------------------------------------
-             EMPTY RESPONSE
-          ------------------------------------------------------------ */
+              messages,
 
-          if (!reply) {
-            if (
-              attempt <
-              attemptLimit
-            ) {
-              continue;
-            }
+              temperature: 0.55,
 
-            return {
-              ok: false,
-              reply: "",
-              messageId: null,
-              generatedResponseId:
-                null,
-              usedMemories:
-                memoryHits.length,
-              errorKind:
-                "grok",
-              error:
-                "The AI service returned no usable final response.",
-            };
-          }
+              top_p: 0.9,
 
-          /* ------------------------------------------------------------
-             ANTI-ECHO CHECK
-          ------------------------------------------------------------ */
+              max_tokens: 350,
 
-          if (
-            isObviousEcho(
-              data.message,
-              reply,
-            )
-          ) {
-            console.warn(
-              "[generateReply] Model returned an obvious echo of the user's message.",
+              reasoning: {
+                enabled: false,
+                exclude: true,
+              },
+            }),
+
+            signal: controller.signal,
+          },
+        );
+
+        clearTimeout(timeout);
+
+        if (response.status === 429) {
+          if (attempt < attemptLimit) {
+            await new Promise(
+              (resolve) =>
+                setTimeout(
+                  resolve,
+                  1000,
+                ),
             );
 
-            /*
-             * Retry once with an explicit anti-copy instruction.
-             *
-             * This is intentionally done without another database query,
-             * so the response remains fast.
-             */
-            if (
-              attempt <
-              attemptLimit
-            ) {
-              messages.push({
-                role:
-                  "system" as const,
-
-                content:
-                  "IMPORTANT: Your previous draft copied the user's message. Generate a NEW response from the replica's historical replies. NEVER return the user's message itself.",
-              });
-
-              continue;
-            }
-
-            return {
-              ok: false,
-              reply: "",
-              messageId: null,
-              generatedResponseId:
-                null,
-              usedMemories:
-                memoryHits.length,
-              errorKind:
-                "grok",
-              error:
-                "The generated response was rejected because it copied the user's message.",
-            };
+            continue;
           }
 
-          break;
-        } catch (error) {
-          clearTimeout(
-            timeout,
+          return {
+            ok: false,
+            reply: "",
+            messageId: null,
+            generatedResponseId: null,
+            usedMemories:
+              memoryHits.length,
+            errorKind: "rate_limit",
+            error:
+              "OpenRouter is rate limiting requests right now. Try again in a moment.",
+          };
+        }
+
+        if (!response.ok) {
+          const body =
+            await response.text();
+
+          console.error(
+            `[openrouter] ${response.status}: ${body}`,
           );
 
-          const aborted =
-            error instanceof Error &&
-            error.name ===
-              "AbortError";
-
           if (
-            attempt <
-            attemptLimit
+            attempt < attemptLimit &&
+            response.status >= 500
           ) {
+            await new Promise(
+              (resolve) =>
+                setTimeout(
+                  resolve,
+                  600,
+                ),
+            );
+
             continue;
+          }
+
+          let readableError =
+            `The AI service returned an error (${response.status}).`;
+
+          try {
+            const parsed =
+              JSON.parse(body) as {
+                error?: {
+                  message?: string;
+                };
+              };
+
+            if (
+              parsed?.error?.message
+            ) {
+              readableError =
+                `OpenRouter: ${parsed.error.message}`;
+            }
+          } catch {
+            // Keep generic error.
           }
 
           return {
@@ -1467,186 +1503,228 @@ Stay completely in character.
               null,
             usedMemories:
               memoryHits.length,
-            errorKind:
-              aborted
-                ? "timeout"
-                : "unknown",
-            error:
-              aborted
-                ? "The AI service took too long to respond. Try again."
-                : "Could not reach OpenRouter. Check your connection and retry.",
+            errorKind: "grok",
+            error: readableError,
           };
         }
-      }
 
-      /* ================================================================
-         18. FINAL VALIDATION
-      ================================================================ */
+        const payload =
+          (await response.json()) as {
+            choi        const payload =
+          (await response.json()) as {
+            choices?: {
+              message?: {
+                content?: string;
+              };
+            }[];
 
-      reply =
-        sanitizeFinalReply(
-          reply,
-        );
+            usage?: Record<string, unknown>;
 
-      if (!reply) {
-        return {
-          ok: false,
-          reply: "",
-          messageId: null,
-          generatedResponseId:
-            null,
-          usedMemories:
-            memoryHits.length,
-          errorKind:
-            "grok",
-          error:
-            "No valid final response was generated.",
-        };
-      }
+            model?: string;
 
-      if (
-        isObviousEcho(
-          data.message,
-          reply,
-        )
-      ) {
-        return {
-          ok: false,
-          reply: "",
-          messageId: null,
-          generatedResponseId:
-            null,
-          usedMemories:
-            memoryHits.length,
-          errorKind:
-            "grok",
-          error:
-            "The generated response was rejected because it copied the user's message.",
-        };
-      }
+            id?: string;
+          };
 
-      /* ================================================================
-         19. SAVE GENERATED RESPONSE
-      ================================================================ */
+        const rawReply =
+          payload.choices?.[0]?.message?.content ?? "";
 
-      const {
-        data: generated,
-        error: generatedError,
-      } = await supabase
-        .from(
-          "generated_responses",
-        )
-        .insert({
-          owner_id: uid,
+        reply = sanitizeFinalReply(rawReply);
 
-          replica_id:
-            data.replicaId,
+        openRouterMeta = {
+          provider: "openrouter",
+          model: payload.model ?? "openrouter/free",
+          request_id: payload.id ?? null,
+          usage: payload.usage ?? {},
+          attempt,
 
-          user_message:
-            data.message,
-
-          generated_response:
-            reply,
-
-          retrieval_context: {
-            query:
-              data.message,
-
-            similar_exchanges:
-              uniqueExchanges.length,
-
-            authentic_messages:
-              uniqueReplicaMessages.length,
-
-            memories:
-              memoryHits
-                .slice(0, 8)
-                .map(
-                  (memory) =>
-                    memory.title,
-                ),
-
-            history:
-              history.length,
+          retrieval: {
+            similar_exchanges: rankedExchanges.length,
+            strongest_similarity: strongestSimilarity,
+            authentic_messages: uniqueReplicaMessages.length,
+            memories: memoryHits.length,
           },
+        };
 
-          generation_metadata:
-            openRouterMeta,
-        })
-        .select("id")
-        .single();
+        /* ------------------------------------------------------------
+           EMPTY RESPONSE
+        ------------------------------------------------------------ */
 
-      if (
-        generatedError
-      ) {
+        if (!reply) {
+          if (attempt < attemptLimit) {
+            continue;
+          }
+
+          return {
+            ok: false,
+            reply: "",
+            messageId: null,
+            generatedResponseId: null,
+            usedMemories: memoryHits.length,
+            errorKind: "grok",
+            error:
+              "The AI service returned no usable response.",
+          };
+        }
+
+        break;
+      } catch (error) {
+        clearTimeout(timeout);
+
+        const aborted =
+          error instanceof Error &&
+          error.name === "AbortError";
+
+        if (attempt < attemptLimit) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, 500),
+          );
+
+          continue;
+        }
+
         return {
           ok: false,
-          reply,
+          reply: "",
           messageId: null,
-          generatedResponseId:
-            null,
-          usedMemories:
-            memoryHits.length,
-          errorKind:
-            "database",
-          error:
-            generatedError.message,
+          generatedResponseId: null,
+          usedMemories: memoryHits.length,
+          errorKind: aborted
+            ? "timeout"
+            : "unknown",
+          error: aborted
+            ? "The AI service took too long to respond. Try again."
+            : "Could not reach OpenRouter. Check your connection and retry.",
         };
       }
+    }
 
-      /* ================================================================
-         20. SAVE REPLICA CHAT MESSAGE
-      ================================================================ */
+    /* ================================================================
+       17. FINAL RESPONSE VALIDATION
+    ================================================================= */
 
-      const {
-        data: stored,
-        error: storeError,
-      } = await supabase
-        .from(
-          "chat_session_messages",
-        )
-        .insert({
-          owner_id: uid,
+    reply = sanitizeFinalReply(reply);
 
-          session_id:
-            data.sessionId,
+    if (!reply) {
+      return {
+        ok: false,
+        reply: "",
+        messageId: null,
+        generatedResponseId: null,
+        usedMemories: memoryHits.length,
+        errorKind: "grok",
+        error: "No valid final response was generated.",
+      };
+    }
 
-          sender_role:
-            "replica",
+    /* ================================================================
+       18. SAVE GENERATED RESPONSE
+    ================================================================= */
 
-          message_text:
-            reply,
+    const {
+      data: generated,
+      error: generatedError,
+    } = await supabase
+      .from("generated_responses")
+      .insert({
+        owner_id: uid,
 
-          generated_response_id:
-            generated.id,
+        replica_id: data.replicaId,
 
-          reply_to_message_id:
-            data.replyToMessageId ??
-            null,
-        })
-        .select("id")
-        .single();
+        user_message: data.message,
 
-      if (storeError) {
-        return {
-          ok: false,
-          reply,
-          messageId: null,
-          generatedResponseId:
-            generated.id as string,
-          usedMemories:
-            memoryHits.length,
-          errorKind:
-            "database",
-          error:
-            storeError.message,
-        };
-      }
+        generated_response: reply,
 
-      /* ================================================================
-         21. UPDATE CHAT SESSION
-      ================================================================ */
+        retrieval_context: {
+          query: data.message,
 
+          similar_exchanges:
+            rankedExchanges.length,
+
+          strongest_similarity:
+            strongestSimilarity,
+
+          authentic_messages:
+            uniqueReplicaMessages.length,
+
+          memories: memoryHits
+            .slice(0, 8)
+            .map((m) => m.title),
+
+          history: history.length,
+        },
+
+        generation_metadata: openRouterMeta,
+      })
+      .select("id")
+      .single();
+
+    if (generatedError) {
+      console.error(
+        "[database] generated_responses insert:",
+        generatedError.message,
+      );
+
+      return {
+        ok: false,
+        reply,
+        messageId: null,
+        generatedResponseId: null,
+        usedMemories: memoryHits.length,
+        errorKind: "database",
+        error: generatedError.message,
+      };
+    }
+
+    /* ================================================================
+       19. SAVE REPLICA MESSAGE
+    ================================================================= */
+
+    const {
+      data: stored,
+      error: storeError,
+    } = await supabase
+      .from("chat_session_messages")
+      .insert({
+        owner_id: uid,
+
+        session_id: data.sessionId,
+
+        sender_role: "replica",
+
+        message_text: reply,
+
+        generated_response_id:
+          generated.id,
+
+        reply_to_message_id:
+          data.replyToMessageId ?? null,
+      })
+      .select("id")
+      .single();
+
+    if (storeError) {
+      console.error(
+        "[database] chat_session_messages insert:",
+        storeError.message,
+      );
+
+      return {
+        ok: false,
+        reply,
+        messageId: null,
+        generatedResponseId:
+          generated.id as string,
+        usedMemories: memoryHits.length,
+        errorKind: "database",
+        error: storeError.message,
+      };
+    }
+
+    /* ================================================================
+       20. UPDATE CHAT SESSION
+    ================================================================= */
+
+    const { error: sessionUpdateError } =
       await supabase
         .from("chat_sessions")
         .update({
@@ -1658,23 +1736,29 @@ Stay completely in character.
           data.sessionId,
         );
 
-      /* ================================================================
-         22. SUCCESS
-      ================================================================ */
+    if (sessionUpdateError) {
+      console.warn(
+        "[database] chat_sessions update:",
+        sessionUpdateError.message,
+      );
+    }
 
-      return {
-        ok: true,
+    /* ================================================================
+       21. SUCCESS
+    ================================================================= */
 
-        reply,
+    return {
+      ok: true,
 
-        messageId:
-          stored.id as string,
+      reply,
 
-        generatedResponseId:
-          generated.id as string,
+      messageId:
+        stored.id as string,
 
-        usedMemories:
-          memoryHits.length,
-      };
-    },
-  );
+      generatedResponseId:
+        generated.id as string,
+
+      usedMemories:
+        memoryHits.length,
+    };
+  });

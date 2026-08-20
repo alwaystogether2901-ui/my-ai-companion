@@ -565,8 +565,12 @@ export async function importConversationFile(options: {
       needsParticipantSelection: true,
     };
   } catch (error) {
+    // Persist what already landed so a retry resumes instead of re-inserting.
+    checkpoint.flush();
+    saveResume(resumeKey, resume);
     const wrapped = stageError(currentStage, error);
     const message = formatError(wrapped);
+
     await updateJob(jobId, {
       status: "failed",
       error_message: message.slice(0, 900),

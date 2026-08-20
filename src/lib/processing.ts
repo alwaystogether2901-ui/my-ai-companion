@@ -390,9 +390,20 @@ export async function importConversationFile(options: {
         metadata: { sender: m.senderName, sent_at: m.sentAt, source: file.name },
       }));
     if (memoryRows.length) {
-      const { error: memoryError } = await supabase.from("memory_items").insert(memoryRows);
-      if (memoryError) throw stageError("Building memories", memoryError, "database");
+      await writeInBatches(
+        memoryRows,
+        async (batch, batchIndex) => {
+          const unit = `mem:batch:${batchIndex}`;
+          if (checkpoint.has(unit)) return;
+          const { error: memoryError } = await supabase.from("memory_items").insert(batch);
+          if (memoryError) throw stageError("Building memories", memoryError, "database");
+          checkpoint.mark(unit);
+        },
+        { batchSize: 250, concurrency: 2 },
+      );
+      checkpoint.flush();
     }
+
 
     let mediaSaved = 0;
     for (const media of parsed.mediaFiles) {

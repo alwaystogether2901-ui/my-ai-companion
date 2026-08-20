@@ -8,6 +8,53 @@ import {
 } from "./data";
 import { parseUploadedFile, guessMediaType, type ParsedConversation } from "./parsers";
 import { analyzeStyle } from "./style-analysis";
+import { createCheckpoint, throttle, writeInBatches } from "./batch";
+
+/* ------------------------------------------------------------------ resume */
+/**
+ * Remembers the conversation rows created by an interrupted import so a re-run
+ * writes the remaining message batches into the SAME parents instead of
+ * duplicating (or orphaning) data. Keyed by content hash, never by user id.
+ */
+type ResumeState = { conversationIds: Record<number, string>; updatedAt: number };
+const RESUME_PREFIX = "at:resume:";
+const RESUME_TTL = 7 * 24 * 60 * 60 * 1000;
+
+function loadResume(key: string): ResumeState {
+  if (typeof localStorage === "undefined") return { conversationIds: {}, updatedAt: Date.now() };
+  try {
+    const raw = localStorage.getItem(RESUME_PREFIX + key);
+    if (raw) {
+      const parsed = JSON.parse(raw) as ResumeState;
+      if (parsed.updatedAt && Date.now() - parsed.updatedAt < RESUME_TTL && parsed.conversationIds) {
+        return parsed;
+      }
+    }
+  } catch {
+    /* corrupt entry — start clean */
+  }
+  return { conversationIds: {}, updatedAt: Date.now() };
+}
+
+function saveResume(key: string, state: ResumeState) {
+  if (typeof localStorage === "undefined") return;
+  state.updatedAt = Date.now();
+  try {
+    localStorage.setItem(RESUME_PREFIX + key, JSON.stringify(state));
+  } catch {
+    /* quota — resume is best-effort */
+  }
+}
+
+function clearResume(key: string) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.removeItem(RESUME_PREFIX + key);
+  } catch {
+    /* ignore */
+  }
+}
+
 
 /** Named pipeline stages — the UI shows exactly which one failed. */
 export const IMPORT_STAGES = [

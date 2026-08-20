@@ -558,3 +558,22 @@ as $$
 $$;
 
 grant execute on function public.replica_frequent_lines(uuid, integer) to authenticated;
+
+-- ---------------------------------------------------------------------------
+-- 10e. Chat idempotency: exactly ONE replica reply per user message.
+--      A retry (or a duplicated request) reuses the same reply_to_message_id,
+--      so the second insert is rejected instead of creating a second bubble.
+--      Legacy duplicates are collapsed first so the index can be created.
+-- ---------------------------------------------------------------------------
+delete from public.chat_session_messages c
+using public.chat_session_messages keep
+where c.sender_role = 'replica'
+  and c.reply_to_message_id is not null
+  and keep.sender_role = 'replica'
+  and keep.reply_to_message_id = c.reply_to_message_id
+  and keep.session_id = c.session_id
+  and (keep.created_at, keep.id) < (c.created_at, c.id);
+
+create unique index if not exists chat_session_messages_one_reply_idx
+  on public.chat_session_messages (session_id, reply_to_message_id)
+  where sender_role = 'replica' and reply_to_message_id is not null;

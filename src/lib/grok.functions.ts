@@ -1412,11 +1412,6 @@ ONE FINAL CHAT MESSAGE ONLY.
               top_p: 0.9,
 
               max_tokens: 350,
-
-              reasoning: {
-                enabled: false,
-                exclude: true,
-              },
             }),
 
             signal: controller.signal,

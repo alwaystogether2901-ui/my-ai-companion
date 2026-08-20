@@ -549,7 +549,10 @@ export async function importConversationFile(options: {
       total_items: allMessages.length,
       completed_at: new Date().toISOString(),
     });
+    checkpoint.clear();
+    clearResume(resumeKey);
     report("Complete", "Import complete — now choose who is who", 100);
+
 
     return {
       replicaId: replicaId!,

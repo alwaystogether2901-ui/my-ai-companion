@@ -513,39 +513,16 @@ export async function finalizeParticipantRoles(choice: ParticipantChoice): Promi
     throw new AppError("The selected replica participant no longer exists.", { kind: "validation" });
   }
 
-  // Roles: everyone else becomes 'other'.
-  for (const participant of participants ?? []) {
-    const role =
-      participant.id === choice.meParticipantId
-        ? "me"
-        : participant.id === choice.replicaParticipantId
-          ? "replica"
-          : "other";
-    const { error } = await supabase
-      .from("replica_participants")
-      .update({ role })
-      .eq("id", participant.id);
-    if (error) throw stageError("Saving participants", error, "database");
-  }
+  // Roles + message stamping happen entirely database-side: three set-based
+  // statements inside one RPC instead of N browser round trips (which timed out
+  // on 300k-message replicas). Ownership is re-checked inside the function.
+  const { error: rolesError } = await supabase.rpc("assign_participant_roles", {
+    p_replica_id: choice.replicaId,
+    p_me: choice.meParticipantId,
+    p_replica: choice.replicaParticipantId,
+  });
+  if (rolesError) throw stageError("Saving participants", rolesError, "database");
 
-  // Stamp message roles from the participant link (so retrieval can filter).
-  for (const [participantId, role] of [
-    [choice.replicaParticipantId, "replica"],
-    [choice.meParticipantId, "me"],
-  ] as const) {
-    const { error } = await supabase
-      .from("messages")
-      .update({ sender_role: role })
-      .eq("replica_id", choice.replicaId)
-      .eq("participant_id", participantId);
-    if (error) throw stageError("Saving participants", error, "database");
-  }
-  const { error: othersError } = await supabase
-    .from("messages")
-    .update({ sender_role: "other" })
-    .eq("replica_id", choice.replicaId)
-    .eq("sender_role", "unassigned");
-  if (othersError) throw stageError("Saving participants", othersError, "database");
 
   // Rebuild the style profile from the SELECTED person's own messages only.
   const { data: replicaMessages, error: messagesError } = await supabase

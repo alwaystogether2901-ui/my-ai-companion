@@ -306,64 +306,98 @@ export async function importConversationFile(options: {
       (participants ?? []).map((p) => [p.display_name as string, p.id as string]),
     );
 
+    // Progress/job writes are throttled: 300k rows must not produce 750 job
+    // UPDATEs (that write storm is what got requests cancelled).
+    const pushJobProgress = throttle((patch: Partial<ProcessingJob>) => {
+      void updateJob(jobId, patch);
+    }, 2500);
+
     let insertedMessages = 0;
     for (const [index, conversation] of conversations.entries()) {
-      const times = conversation.messages
-        .map((m) => m.sentAt)
-        .filter((value): value is string => Boolean(value))
-        .sort();
-      const { data: conversationRow, error: conversationError } = await supabase
-        .from("conversations")
-        .insert({
-          owner_id: ownerId,
-          replica_id: replicaId,
-          title: conversation.title,
-          source_platform: conversation.sourcePlatform,
-          started_at: times[0] ?? null,
-          ended_at: times[times.length - 1] ?? null,
-          message_count: conversation.messages.length,
-        })
-        .select("id")
-        .single();
-      if (conversationError) throw stageError("Importing conversations", conversationError, "database");
+      // Resume: reuse the conversation row from an interrupted run so the
+      // per-batch checkpoints below still point at the right parent.
+      let conversationId = resume.conversationIds[index] ?? null;
+      if (!conversationId) {
+        const times = conversation.messages
+          .map((m) => m.sentAt)
+          .filter((value): value is string => Boolean(value))
+          .sort();
+        const { data: conversationRow, error: conversationError } = await supabase
+          .from("conversations")
+          .insert({
+            owner_id: ownerId,
+            replica_id: replicaId,
+            title: conversation.title,
+            source_platform: conversation.sourcePlatform,
+            started_at: times[0] ?? null,
+            ended_at: times[times.length - 1] ?? null,
+            message_count: conversation.messages.length,
+          })
+          .select("id")
+          .single();
+        if (conversationError)
+          throw stageError("Importing conversations", conversationError, "database");
+        conversationId = conversationRow!.id as string;
+        resume.conversationIds[index] = conversationId;
+        saveResume(resumeKey, resume);
+      }
 
       currentStage = "Importing messages";
-      const chunkSize = 400;
-      for (let offset = 0; offset < conversation.messages.length; offset += chunkSize) {
-        const chunk = conversation.messages.slice(offset, offset + chunkSize).map((message) => ({
-          owner_id: ownerId,
-          replica_id: replicaId,
-          conversation_id: conversationRow!.id,
-          participant_id: participantByName.get(message.senderName) ?? null,
-          // Roles are assigned only after the user picks ME / REPLICA.
-          sender_role: "unassigned",
-          sender_name: message.senderName,
-          message_text: message.text,
-          message_type: message.messageType,
-          media_path: null,
-          original_message_id: message.originalMessageId ?? null,
-          reply_to_message_id: message.replyToMessageId ?? null,
-          sent_at: message.sentAt,
-          source_platform: conversation.sourcePlatform,
-          metadata: message.mediaHint ? { media_hint: message.mediaHint } : {},
-        }));
-        const { error: messageError } = await supabase.from("messages").insert(chunk);
-        if (messageError) throw stageError("Importing messages", messageError, "database");
-        insertedMessages += chunk.length;
-        const progress = 56 + Math.round((insertedMessages / Math.max(allMessages.length, 1)) * 24);
-        report(
-          "Importing messages",
-          `Importing messages (${insertedMessages.toLocaleString()}/${allMessages.length.toLocaleString()})`,
-          progress,
-        );
-        await updateJob(jobId, { progress, processed_items: insertedMessages });
-      }
+      const rows = conversation.messages.map((message) => ({
+        owner_id: ownerId,
+        replica_id: replicaId,
+        conversation_id: conversationId,
+        participant_id: participantByName.get(message.senderName) ?? null,
+        // Roles are assigned only after the user picks ME / REPLICA.
+        sender_role: "unassigned",
+        sender_name: message.senderName,
+        message_text: message.text,
+        message_type: message.messageType,
+        media_path: null,
+        original_message_id: message.originalMessageId ?? null,
+        reply_to_message_id: message.replyToMessageId ?? null,
+        sent_at: message.sentAt,
+        source_platform: conversation.sourcePlatform,
+        metadata: message.mediaHint ? { media_hint: message.mediaHint } : {},
+      }));
+
+      await writeInBatches(
+        rows,
+        async (batch, batchIndex) => {
+          const unit = `conv:${index}:batch:${batchIndex}`;
+          if (checkpoint.has(unit)) return;
+          const { error: messageError } = await supabase.from("messages").insert(batch);
+          if (messageError) throw stageError("Importing messages", messageError, "database");
+          checkpoint.mark(unit);
+        },
+        {
+          batchSize: 1000,
+          concurrency: 3,
+          retries: 4,
+          onBatch: ({ rows: doneRows }) => {
+            const total = Math.max(allMessages.length, 1);
+            const progress =
+              56 + Math.round(((insertedMessages + doneRows) / total) * 24);
+            report(
+              "Importing messages",
+              `Importing messages (${(insertedMessages + doneRows).toLocaleString()}/${allMessages.length.toLocaleString()})`,
+              progress,
+            );
+            pushJobProgress({ progress, processed_items: insertedMessages + doneRows });
+          },
+        },
+      );
+      insertedMessages += rows.length;
+      checkpoint.flush();
+
       report(
         "Importing conversations",
         `Imported conversation ${index + 1}/${conversations.length}`,
         Math.min(80, 56 + Math.round(((index + 1) / conversations.length) * 24)),
       );
     }
+    await updateJob(jobId, { progress: 80, processed_items: insertedMessages });
+
 
     // ---- Analyzing style (provisional: recomputed after ME/REPLICA choice) ---
     currentStage = "Analyzing style";

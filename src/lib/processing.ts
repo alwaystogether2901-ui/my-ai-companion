@@ -201,6 +201,13 @@ export async function importConversationFile(options: {
     throw stageError("Preparing", error, "database");
   }
 
+  // Resumable state for this exact file. Nothing user-specific is hardcoded:
+  // the key is derived from the owner's own id + the file content hash.
+  const resumeKey = `${ownerId}:${contentHash}`;
+  const checkpoint = createCheckpoint(resumeKey);
+  const resume = loadResume(resumeKey);
+
+
   let replicaId = options.replicaId ?? null;
   try {
     if (!replicaId) {

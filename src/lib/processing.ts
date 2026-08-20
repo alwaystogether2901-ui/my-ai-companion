@@ -8,6 +8,53 @@ import {
 } from "./data";
 import { parseUploadedFile, guessMediaType, type ParsedConversation } from "./parsers";
 import { analyzeStyle } from "./style-analysis";
+import { createCheckpoint, throttle, writeInBatches } from "./batch";
+
+/* ------------------------------------------------------------------ resume */
+/**
+ * Remembers the conversation rows created by an interrupted import so a re-run
+ * writes the remaining message batches into the SAME parents instead of
+ * duplicating (or orphaning) data. Keyed by content hash, never by user id.
+ */
+type ResumeState = { conversationIds: Record<number, string>; updatedAt: number };
+const RESUME_PREFIX = "at:resume:";
+const RESUME_TTL = 7 * 24 * 60 * 60 * 1000;
+
+function loadResume(key: string): ResumeState {
+  if (typeof localStorage === "undefined") return { conversationIds: {}, updatedAt: Date.now() };
+  try {
+    const raw = localStorage.getItem(RESUME_PREFIX + key);
+    if (raw) {
+      const parsed = JSON.parse(raw) as ResumeState;
+      if (parsed.updatedAt && Date.now() - parsed.updatedAt < RESUME_TTL && parsed.conversationIds) {
+        return parsed;
+      }
+    }
+  } catch {
+    /* corrupt entry — start clean */
+  }
+  return { conversationIds: {}, updatedAt: Date.now() };
+}
+
+function saveResume(key: string, state: ResumeState) {
+  if (typeof localStorage === "undefined") return;
+  state.updatedAt = Date.now();
+  try {
+    localStorage.setItem(RESUME_PREFIX + key, JSON.stringify(state));
+  } catch {
+    /* quota — resume is best-effort */
+  }
+}
+
+function clearResume(key: string) {
+  if (typeof localStorage === "undefined") return;
+  try {
+    localStorage.removeItem(RESUME_PREFIX + key);
+  } catch {
+    /* ignore */
+  }
+}
+
 
 /** Named pipeline stages — the UI shows exactly which one failed. */
 export const IMPORT_STAGES = [
@@ -153,6 +200,13 @@ export async function importConversationFile(options: {
   } catch (error) {
     throw stageError("Preparing", error, "database");
   }
+
+  // Resumable state for this exact file. Nothing user-specific is hardcoded:
+  // the key is derived from the owner's own id + the file content hash.
+  const resumeKey = `${ownerId}:${contentHash}`;
+  const checkpoint = createCheckpoint(resumeKey);
+  const resume = loadResume(resumeKey);
+
 
   let replicaId = options.replicaId ?? null;
   try {
@@ -306,64 +360,98 @@ export async function importConversationFile(options: {
       (participants ?? []).map((p) => [p.display_name as string, p.id as string]),
     );
 
+    // Progress/job writes are throttled: 300k rows must not produce 750 job
+    // UPDATEs (that write storm is what got requests cancelled).
+    const pushJobProgress = throttle((patch: Partial<ProcessingJob>) => {
+      void updateJob(jobId, patch);
+    }, 2500);
+
     let insertedMessages = 0;
     for (const [index, conversation] of conversations.entries()) {
-      const times = conversation.messages
-        .map((m) => m.sentAt)
-        .filter((value): value is string => Boolean(value))
-        .sort();
-      const { data: conversationRow, error: conversationError } = await supabase
-        .from("conversations")
-        .insert({
-          owner_id: ownerId,
-          replica_id: replicaId,
-          title: conversation.title,
-          source_platform: conversation.sourcePlatform,
-          started_at: times[0] ?? null,
-          ended_at: times[times.length - 1] ?? null,
-          message_count: conversation.messages.length,
-        })
-        .select("id")
-        .single();
-      if (conversationError) throw stageError("Importing conversations", conversationError, "database");
+      // Resume: reuse the conversation row from an interrupted run so the
+      // per-batch checkpoints below still point at the right parent.
+      let conversationId = resume.conversationIds[index] ?? null;
+      if (!conversationId) {
+        const times = conversation.messages
+          .map((m) => m.sentAt)
+          .filter((value): value is string => Boolean(value))
+          .sort();
+        const { data: conversationRow, error: conversationError } = await supabase
+          .from("conversations")
+          .insert({
+            owner_id: ownerId,
+            replica_id: replicaId,
+            title: conversation.title,
+            source_platform: conversation.sourcePlatform,
+            started_at: times[0] ?? null,
+            ended_at: times[times.length - 1] ?? null,
+            message_count: conversation.messages.length,
+          })
+          .select("id")
+          .single();
+        if (conversationError)
+          throw stageError("Importing conversations", conversationError, "database");
+        conversationId = conversationRow!.id as string;
+        resume.conversationIds[index] = conversationId;
+        saveResume(resumeKey, resume);
+      }
 
       currentStage = "Importing messages";
-      const chunkSize = 400;
-      for (let offset = 0; offset < conversation.messages.length; offset += chunkSize) {
-        const chunk = conversation.messages.slice(offset, offset + chunkSize).map((message) => ({
-          owner_id: ownerId,
-          replica_id: replicaId,
-          conversation_id: conversationRow!.id,
-          participant_id: participantByName.get(message.senderName) ?? null,
-          // Roles are assigned only after the user picks ME / REPLICA.
-          sender_role: "unassigned",
-          sender_name: message.senderName,
-          message_text: message.text,
-          message_type: message.messageType,
-          media_path: null,
-          original_message_id: message.originalMessageId ?? null,
-          reply_to_message_id: message.replyToMessageId ?? null,
-          sent_at: message.sentAt,
-          source_platform: conversation.sourcePlatform,
-          metadata: message.mediaHint ? { media_hint: message.mediaHint } : {},
-        }));
-        const { error: messageError } = await supabase.from("messages").insert(chunk);
-        if (messageError) throw stageError("Importing messages", messageError, "database");
-        insertedMessages += chunk.length;
-        const progress = 56 + Math.round((insertedMessages / Math.max(allMessages.length, 1)) * 24);
-        report(
-          "Importing messages",
-          `Importing messages (${insertedMessages.toLocaleString()}/${allMessages.length.toLocaleString()})`,
-          progress,
-        );
-        await updateJob(jobId, { progress, processed_items: insertedMessages });
-      }
+      const rows = conversation.messages.map((message) => ({
+        owner_id: ownerId,
+        replica_id: replicaId,
+        conversation_id: conversationId,
+        participant_id: participantByName.get(message.senderName) ?? null,
+        // Roles are assigned only after the user picks ME / REPLICA.
+        sender_role: "unassigned",
+        sender_name: message.senderName,
+        message_text: message.text,
+        message_type: message.messageType,
+        media_path: null,
+        original_message_id: message.originalMessageId ?? null,
+        reply_to_message_id: message.replyToMessageId ?? null,
+        sent_at: message.sentAt,
+        source_platform: conversation.sourcePlatform,
+        metadata: message.mediaHint ? { media_hint: message.mediaHint } : {},
+      }));
+
+      await writeInBatches(
+        rows,
+        async (batch, batchIndex) => {
+          const unit = `conv:${index}:batch:${batchIndex}`;
+          if (checkpoint.has(unit)) return;
+          const { error: messageError } = await supabase.from("messages").insert(batch);
+          if (messageError) throw stageError("Importing messages", messageError, "database");
+          checkpoint.mark(unit);
+        },
+        {
+          batchSize: 1000,
+          concurrency: 3,
+          retries: 4,
+          onBatch: ({ rows: doneRows }) => {
+            const total = Math.max(allMessages.length, 1);
+            const progress =
+              56 + Math.round(((insertedMessages + doneRows) / total) * 24);
+            report(
+              "Importing messages",
+              `Importing messages (${(insertedMessages + doneRows).toLocaleString()}/${allMessages.length.toLocaleString()})`,
+              progress,
+            );
+            pushJobProgress({ progress, processed_items: insertedMessages + doneRows });
+          },
+        },
+      );
+      insertedMessages += rows.length;
+      checkpoint.flush();
+
       report(
         "Importing conversations",
         `Imported conversation ${index + 1}/${conversations.length}`,
         Math.min(80, 56 + Math.round(((index + 1) / conversations.length) * 24)),
       );
     }
+    await updateJob(jobId, { progress: 80, processed_items: insertedMessages });
+
 
     // ---- Analyzing style (provisional: recomputed after ME/REPLICA choice) ---
     currentStage = "Analyzing style";
@@ -390,9 +478,20 @@ export async function importConversationFile(options: {
         metadata: { sender: m.senderName, sent_at: m.sentAt, source: file.name },
       }));
     if (memoryRows.length) {
-      const { error: memoryError } = await supabase.from("memory_items").insert(memoryRows);
-      if (memoryError) throw stageError("Building memories", memoryError, "database");
+      await writeInBatches(
+        memoryRows,
+        async (batch, batchIndex) => {
+          const unit = `mem:batch:${batchIndex}`;
+          if (checkpoint.has(unit)) return;
+          const { error: memoryError } = await supabase.from("memory_items").insert(batch);
+          if (memoryError) throw stageError("Building memories", memoryError, "database");
+          checkpoint.mark(unit);
+        },
+        { batchSize: 250, concurrency: 2 },
+      );
+      checkpoint.flush();
     }
+
 
     let mediaSaved = 0;
     for (const media of parsed.mediaFiles) {
@@ -450,7 +549,10 @@ export async function importConversationFile(options: {
       total_items: allMessages.length,
       completed_at: new Date().toISOString(),
     });
+    checkpoint.clear();
+    clearResume(resumeKey);
     report("Complete", "Import complete — now choose who is who", 100);
+
 
     return {
       replicaId: replicaId!,
@@ -463,8 +565,12 @@ export async function importConversationFile(options: {
       needsParticipantSelection: true,
     };
   } catch (error) {
+    // Persist what already landed so a retry resumes instead of re-inserting.
+    checkpoint.flush();
+    saveResume(resumeKey, resume);
     const wrapped = stageError(currentStage, error);
     const message = formatError(wrapped);
+
     await updateJob(jobId, {
       status: "failed",
       error_message: message.slice(0, 900),
@@ -513,39 +619,16 @@ export async function finalizeParticipantRoles(choice: ParticipantChoice): Promi
     throw new AppError("The selected replica participant no longer exists.", { kind: "validation" });
   }
 
-  // Roles: everyone else becomes 'other'.
-  for (const participant of participants ?? []) {
-    const role =
-      participant.id === choice.meParticipantId
-        ? "me"
-        : participant.id === choice.replicaParticipantId
-          ? "replica"
-          : "other";
-    const { error } = await supabase
-      .from("replica_participants")
-      .update({ role })
-      .eq("id", participant.id);
-    if (error) throw stageError("Saving participants", error, "database");
-  }
+  // Roles + message stamping happen entirely database-side: three set-based
+  // statements inside one RPC instead of N browser round trips (which timed out
+  // on 300k-message replicas). Ownership is re-checked inside the function.
+  const { error: rolesError } = await supabase.rpc("assign_participant_roles", {
+    p_replica_id: choice.replicaId,
+    p_me: choice.meParticipantId,
+    p_replica: choice.replicaParticipantId,
+  });
+  if (rolesError) throw stageError("Saving participants", rolesError, "database");
 
-  // Stamp message roles from the participant link (so retrieval can filter).
-  for (const [participantId, role] of [
-    [choice.replicaParticipantId, "replica"],
-    [choice.meParticipantId, "me"],
-  ] as const) {
-    const { error } = await supabase
-      .from("messages")
-      .update({ sender_role: role })
-      .eq("replica_id", choice.replicaId)
-      .eq("participant_id", participantId);
-    if (error) throw stageError("Saving participants", error, "database");
-  }
-  const { error: othersError } = await supabase
-    .from("messages")
-    .update({ sender_role: "other" })
-    .eq("replica_id", choice.replicaId)
-    .eq("sender_role", "unassigned");
-  if (othersError) throw stageError("Saving participants", othersError, "database");
 
   // Rebuild the style profile from the SELECTED person's own messages only.
   const { data: replicaMessages, error: messagesError } = await supabase

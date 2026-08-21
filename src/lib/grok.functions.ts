@@ -473,6 +473,67 @@ export const generateReply = createServerFn({ method: "POST" })
     }
 
     /* ================================================================
+       14b. RESPONSE HYGIENE — strip reasoning, reject echoes
+    ================================================================= */
+
+    reply = sanitizeReply(reply);
+
+    if (!reply || echoesUser(reply, data.message)) {
+      // One bounded corrective pass, then evidence-based fallback.
+      try {
+        const retryResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            "HTTP-Referer": "https://always-together.vercel.app",
+            "X-Title": "Always Together",
+          },
+          body: JSON.stringify({
+            model: "openrouter/free",
+            messages: [
+              ...messages,
+              {
+                role: "system",
+                content:
+                  "That attempt repeated the user's own words or was empty. Reply as this person would actually respond to that message — a real conversational answer, in their voice, never a copy or paraphrase of the user's message. One line only.",
+              },
+            ],
+            temperature: 0.7,
+            max_tokens: 300,
+          }),
+        });
+
+        if (retryResponse.ok) {
+          const retryPayload = (await retryResponse.json()) as {
+            choices?: { message?: { content?: string } }[];
+          };
+          const candidate = sanitizeReply(retryPayload.choices?.[0]?.message?.content ?? "");
+          if (candidate && !echoesUser(candidate, data.message)) reply = candidate;
+        }
+      } catch {
+        // Fall through to evidence fallback.
+      }
+    }
+
+    if (!reply || echoesUser(reply, data.message)) {
+      const fallback = fallbackFromEvidence(bundle, data.message);
+      if (fallback) {
+        reply = fallback;
+      } else if (!reply) {
+        return {
+          ok: false,
+          reply: "",
+          messageId: null,
+          generatedResponseId: null,
+          usedMemories: memoryHits.length,
+          errorKind: "grok",
+          error: "The AI service returned an empty response.",
+        };
+      }
+    }
+
+    /* ================================================================
        15. SAVE GENERATED RESPONSE
     ================================================================= */
 
@@ -491,16 +552,21 @@ export const generateReply = createServerFn({ method: "POST" })
         generated_response: reply,
 
         retrieval_context: {
-          memories: memoryHits
-            .slice(0, 8)
-            .map((m) => m.title),
+          memories: memoryHits.slice(0, 8).map((m) => m.title),
 
-          examples:
-            sourceExamples?.length ?? 0,
+          exchanges: bundle.exchanges.slice(0, 8).map((exchange) => ({
+            prompt: exchange.promptText.slice(0, 160),
+            reply: exchange.replyText.slice(0, 160),
+            score: Number(exchange.score.toFixed(3)),
+          })),
 
-          history:
-            history?.length ?? 0,
+          frequent_lines: bundle.frequentLines.length,
+
+          new_topic: bundle.newTopic,
+
+          history: history.length,
         },
+
 
         generation_metadata: openRouterMeta,
       })

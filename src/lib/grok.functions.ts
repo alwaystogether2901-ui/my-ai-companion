@@ -136,85 +136,47 @@ export const generateReply = createServerFn({ method: "POST" })
       ]);
 
     /* ================================================================
-       5. FIND RELEVANT MEMORIES
+       5. LOAD CHAT HISTORY (bounded window)
     ================================================================= */
 
-    const keywords = data.message
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, " ")
-      .split(/\s+/)
-      .filter((word) => word.length > 3)
-      .slice(0, 4);
-
-    const memoryHits: {
-      title: string | null;
-      description: string | null;
-    }[] = [];
-
-    for (const keyword of keywords) {
-      const { data: rows } = await supabase
-        .from("memory_items")
-        .select("title, description")
-        .eq("replica_id", data.replicaId)
-        .ilike("description", `%${keyword}%`)
-        .limit(3);
-
-      if (rows) {
-        memoryHits.push(...rows);
-      }
-    }
-
-    /* ================================================================
-       6. FALLBACK TO RECENT MEMORIES
-    ================================================================= */
-
-    if (memoryHits.length === 0) {
-      const { data: rows } = await supabase
-        .from("memory_items")
-        .select("title, description")
-        .eq("replica_id", data.replicaId)
-        .order("created_at", { ascending: false })
-        .limit(6);
-
-      if (rows) {
-        memoryHits.push(...rows);
-      }
-    }
-
-    /* ================================================================
-       7. LOAD AUTHENTIC REPLICA EXAMPLES
-    ================================================================= */
-
-    const { data: sourceExamples } = await supabase
-      .from("messages")
-      .select("sender_name, sender_role, message_text")
-      .eq("replica_id", data.replicaId)
-      .eq("sender_role", "replica")
-      .not("message_text", "is", null)
-      .limit(40);
-
-    /* ================================================================
-       8. LOAD CHAT HISTORY
-    ================================================================= */
-
-    const { data: history } = await supabase
+    const { data: historyDesc } = await supabase
       .from("chat_session_messages")
       .select("sender_role, message_text")
       .eq("session_id", data.sessionId)
       .order("created_at", { ascending: false })
-      .limit(16);
+      .limit(14);
+
+    const history = (historyDesc ?? []).slice().reverse();
 
     /* ================================================================
-       9. DETERMINE REPLICA NAME
+       6. EVIDENCE-FIRST RETRIEVAL (paired historical exchanges)
+    ================================================================= */
+
+    const {
+      retrieveEvidence,
+      buildEvidencePrompt,
+      sanitizeReply,
+      echoesUser,
+      fallbackFromEvidence,
+    } = await import("./retrieval.server");
+
+    const bundle = await retrieveEvidence(supabase, {
+      replicaId: data.replicaId,
+      message: data.message,
+      history,
+    });
+
+    const memoryHits = bundle.memories;
+
+    /* ================================================================
+       7. DETERMINE REPLICA NAME
     ================================================================= */
 
     const replicaName =
-      (participants ?? []).find(
-        (p) => p.role === "replica",
-      )?.display_name ?? replica.name;
+      (participants ?? []).find((p) => p.role === "replica")?.display_name ?? replica.name;
 
     /* ================================================================
-       10. BUILD STYLE SUMMARY
+       8. BUILD STYLE SUMMARY
     ================================================================= */
 
     const styleSummary = style
@@ -226,43 +188,37 @@ export const generateReply = createServerFn({ method: "POST" })
             length: style.response_length_profile,
             greetings: style.greeting_profile,
             humor: style.humor_profile,
-            vocabulary: (
-              style.vocabulary_profile as {
-                signature_phrases?: unknown;
-              }
-            )?.signature_phrases,
+            vocabulary: (style.vocabulary_profile as { signature_phrases?: unknown })
+              ?.signature_phrases,
           },
           null,
           0,
-        ).slice(0, 4000)
+        ).slice(0, 3000)
       : "No style profile available yet.";
 
     /* ================================================================
-       11. BUILD SYSTEM PROMPT
+       9. BUILD SYSTEM PROMPT
     ================================================================= */
 
     const systemPrompt = [
-      `You are a faithful conversational replica of ${replicaName}.`,
+      `You are not a chatbot or an assistant. You reproduce the exact communication behaviour of ${replicaName}, a real person, reconstructed from their own past conversations.`,
 
-      replica.description
-        ? `Context about them: ${replica.description}`
-        : "",
+      replica.description ? `Context about them: ${replica.description}` : "",
 
-      `Reproduce their voice naturally and consistently.`,
+      `How to answer, in order:
+1. Read the latest message and the recent conversation to understand the CURRENT situation and intent.
+2. Look at the past exchanges below: find the one where the other person said something in a similar SITUATION (not merely similar words).
+3. Use what the replica ACTUALLY replied there as behavioural evidence and adapt it to the current message.
+4. If no past exchange fits, answer naturally in their voice using their real vocabulary — never invent personal facts.`,
 
-      `Match their wording, rhythm, message length, punctuation habits, emoji use, vocabulary, tone, and language mix.`,
-
-      `Use the authentic examples as strong evidence of how they communicate.`,
-
-      `Use memories when they are relevant to the user's message.`,
-
-      `Do not invent personal facts when the available memories do not support them.`,
-
-      `Never mention being an AI, language model, OpenRouter, API, or replica.`,
-
-      `Never explain your reasoning.`,
-
-      `Stay in character.`,
+      `Hard rules:
+- Never repeat or paraphrase the user's own message back as your reply.
+- Never reply with the OTHER person's line from an example.
+- Accuracy and authenticity matter more than creativity or helpfulness.
+- Keep the natural length they normally use; usually short.
+- Keep their language mix, slang, spelling, punctuation and emoji habits.
+- Never mention AI, models, APIs, databases, retrieval, examples or reasoning.
+- Output exactly ONE final conversational reply and nothing else.`,
 
       `Measured style profile: ${styleSummary}`,
 
@@ -270,65 +226,30 @@ export const generateReply = createServerFn({ method: "POST" })
         ? `Owner instructions: ${style.custom_instructions}`
         : "",
 
-      memoryHits.length
-        ? `Relevant memories:
-${memoryHits
-  .slice(0, 8)
-  .map(
-    (m) =>
-      `- ${m.title ?? "memory"}: ${(m.description ?? "").slice(
-        0,
-        400,
-      )}`,
-  )
-  .join("\n")}`
-        : "",
+      buildEvidencePrompt(bundle),
 
-      sourceExamples?.length
-        ? `Authentic examples of how they write:
-${sourceExamples
-  .slice(0, 25)
-  .map(
-    (m) =>
-      `- ${(m.message_text ?? "").slice(0, 200)}`,
-  )
-  .join("\n")}`
-        : "",
-
-      data.mediaPath
-        ? "The user attached a media file to this message."
-        : "",
+      data.mediaPath ? "The user attached a media file to this message." : "",
     ]
       .filter(Boolean)
       .join("\n\n");
 
     /* ================================================================
-       12. BUILD CHAT MESSAGES
+       10. BUILD CHAT MESSAGES
     ================================================================= */
 
     const messages = [
-      {
-        role: "system",
-        content: systemPrompt,
-      },
+      { role: "system", content: systemPrompt },
 
-      ...(history ?? [])
-        .slice()
-        .reverse()
+      ...history
         .map((row) => ({
-          role:
-            row.sender_role === "replica"
-              ? "assistant"
-              : "user",
+          role: row.sender_role === "replica" ? "assistant" : "user",
           content: row.message_text ?? "",
         }))
         .filter((row) => row.content),
 
-      {
-        role: "user",
-        content: data.message,
-      },
+      { role: "user", content: data.message },
     ];
+
 
     /* ================================================================
        13. OPENROUTER API KEY
@@ -552,6 +473,67 @@ ${sourceExamples
     }
 
     /* ================================================================
+       14b. RESPONSE HYGIENE — strip reasoning, reject echoes
+    ================================================================= */
+
+    reply = sanitizeReply(reply);
+
+    if (!reply || echoesUser(reply, data.message)) {
+      // One bounded corrective pass, then evidence-based fallback.
+      try {
+        const retryResponse = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+            "HTTP-Referer": "https://always-together.vercel.app",
+            "X-Title": "Always Together",
+          },
+          body: JSON.stringify({
+            model: "openrouter/free",
+            messages: [
+              ...messages,
+              {
+                role: "system",
+                content:
+                  "That attempt repeated the user's own words or was empty. Reply as this person would actually respond to that message — a real conversational answer, in their voice, never a copy or paraphrase of the user's message. One line only.",
+              },
+            ],
+            temperature: 0.7,
+            max_tokens: 300,
+          }),
+        });
+
+        if (retryResponse.ok) {
+          const retryPayload = (await retryResponse.json()) as {
+            choices?: { message?: { content?: string } }[];
+          };
+          const candidate = sanitizeReply(retryPayload.choices?.[0]?.message?.content ?? "");
+          if (candidate && !echoesUser(candidate, data.message)) reply = candidate;
+        }
+      } catch {
+        // Fall through to evidence fallback.
+      }
+    }
+
+    if (!reply || echoesUser(reply, data.message)) {
+      const fallback = fallbackFromEvidence(bundle, data.message);
+      if (fallback) {
+        reply = fallback;
+      } else if (!reply) {
+        return {
+          ok: false,
+          reply: "",
+          messageId: null,
+          generatedResponseId: null,
+          usedMemories: memoryHits.length,
+          errorKind: "grok",
+          error: "The AI service returned an empty response.",
+        };
+      }
+    }
+
+    /* ================================================================
        15. SAVE GENERATED RESPONSE
     ================================================================= */
 
@@ -570,16 +552,21 @@ ${sourceExamples
         generated_response: reply,
 
         retrieval_context: {
-          memories: memoryHits
-            .slice(0, 8)
-            .map((m) => m.title),
+          memories: memoryHits.slice(0, 8).map((m) => m.title),
 
-          examples:
-            sourceExamples?.length ?? 0,
+          exchanges: bundle.exchanges.slice(0, 8).map((exchange) => ({
+            prompt: exchange.promptText.slice(0, 160),
+            reply: exchange.replyText.slice(0, 160),
+            score: Number(exchange.score.toFixed(3)),
+          })),
 
-          history:
-            history?.length ?? 0,
+          frequent_lines: bundle.frequentLines.length,
+
+          new_topic: bundle.newTopic,
+
+          history: history.length,
         },
+
 
         generation_metadata: openRouterMeta,
       })
